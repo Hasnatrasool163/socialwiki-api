@@ -12,6 +12,7 @@ const socialScrapeRoutes = require('./routes/socialScrapeRoutes');
 const adultKeywordsRoutes = require('./routes/adultKeywordsRoutes');
 const companyHouseRoutes = require('./routes/companyHouseRoutes');
 const postcodeDistrictRoutes = require('./routes/postcodeDistrictRoutes');
+const reportRoutes = require('./routes/reportRoutes');
 const rmAddressRoutes = require('./routes/rmAddressRoutes');
 const propPriceRoutes = require('./routes/propPriceRoutes');
 const app = express();
@@ -87,6 +88,7 @@ app.use('/api/botsol', verifyToken, authorizeRoles('admin'), botsolRoutes);
 app.use('/api/adult-keywords', verifyToken, authorizeRoles('admin'), adultKeywordsRoutes);
 app.use('/api/company-house', verifyToken, authorizeRoles('admin'), companyHouseRoutes);
 app.use('/api/postcode-district', verifyToken, authorizeRoles('admin'), postcodeDistrictRoutes);
+app.use('/api/reports', verifyToken, authorizeRoles('admin'), reportRoutes);
 app.use('/api/rm-address', verifyToken, authorizeRoles('admin'), rmAddressRoutes);
 app.use('/api/prop-price', verifyToken, authorizeRoles('admin'), propPriceRoutes);
 
