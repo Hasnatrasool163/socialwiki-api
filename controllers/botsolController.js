@@ -274,10 +274,33 @@ const stopImport = async (req, res) => {
     }
 };
 
+const cleanData = async (req, res) => {
+    try {
+        const progress = BotsolService.getImportProgress();
+        if (progress.isRunning) {
+            return res.status(409).json({ 
+                success: false, 
+                message: 'An import is currently running. Please wait for it to finish.' 
+            });
+        }
+
+        const result = await BotsolService.cleanDatabase();
+        
+        res.json({
+            success: true,
+            message: `Cleanup successful. ${result.removedCount} duplicates removed.`
+        });
+    } catch (error) {
+        console.error('Error in cleanData controller:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+};
+
 const BotsolController = {
     startImport,
     getStats,
     getImportProgress,
+    getCleanData,
     getPaginatedBotsols,
     stopImport,
 };

@@ -136,9 +136,19 @@ const isWithin90Days = (existingDate, newDate) => {
     return diffDays <= 90;
 };
 
-// Process record
 const processRecord = (record) => {
     try {
+        // --- CLEANING UTILITIES ---
+        const cleanText = (text) => {
+            if (!text) return '';
+            return text
+                .replace(/jho/gi, '') //  Remove "jho"
+                .replace(/[\x00-\x1F\x7F-\x9F]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .substring(0, 400);
+        };
+
         const trimUrl = (url) => {
             if (!url) return '';
             return url
@@ -153,15 +163,7 @@ const processRecord = (record) => {
                 .replace(/^www\./i, '').split('?')[0];
         };
 
-        const cleanText = (text) => {
-            if (!text) return '';
-            return text.replace(/[\x00-\x1F\x7F-\x9F]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim()
-                .substring(0, 400);
-        };
-
-        // Get company name and postcode first
+        // --- FIELD PROCESSING ---
         const companyName = cleanText(record.Name);
         if (!companyName) {
             botsolLogger.debug(`Skipping record with no company name`);
@@ -169,39 +171,34 @@ const processRecord = (record) => {
         }
 
         // Extract postcode from address
+        const rawAddress = cleanText(record.Full_Address);
         let postcode = '';
-        const address = cleanText(record.Full_Address);
-        if (address) {
-            const postcodeMatch = address.match(/[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}/i);
+        if (rawAddress) {
+            const postcodeMatch = rawAddress.match(/[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}/i);
             if (postcodeMatch) {
                 postcode = postcodeMatch[0].toUpperCase();
             }
         }
 
-        if (!postcode) {
-            return null;
-        }
-
-        // Get URL from Website or URL column
-        let url = record?.Website;
-        // if url is found, trim it to only include the domain name 
-        if (url) {
-            url = trimUrl(url);
-        }
-
-        // Clean address by removing the postcode
-        let cleanAddress = address;
+        // Remove postcode, then remove leading " and trailing <space>"
+        let cleanAddress = rawAddress;
         if (cleanAddress && postcode) {
-            // Remove the postcode from the address
-            cleanAddress = cleanAddress.replace(new RegExp(postcode, 'gi'), '').trim();
-            // Clean up any extra commas or spaces that might be left
-            cleanAddress = cleanAddress.replace(/,\s*,/g, ',').replace(/^,\s*/, '').replace(/\s*,$/, '').trim();
+            cleanAddress = cleanAddress.replace(new RegExp(postcode, 'gi'), '');
+        }
+        
+        if (cleanAddress) {
+            cleanAddress = cleanAddress.replace(/^["\s]+|["\s]+$/g, '');
+            // Cleanup extra commas or spaces
+            cleanAddress = cleanAddress.replace(/,\s*,/g, ',')
+                                       .replace(/^,\s*/, '')
+                                       .replace(/\s*,$/, '')
+                                       .trim();
         }
 
         const processedRecord = {
             company_name: companyName,
             postcode: postcode,
-            url: url || '',
+            url: record.Website ? trimUrl(record.Website) : '',
             date: new Date(),
             address: cleanAddress,
             email: cleanText(record.Email),
@@ -558,6 +555,17 @@ const processFile = async (filePath) => {
 // Process record with explicit headers
 const processRecordWithHeaders = (record, headers) => {
     try {
+        // --- CLEANING UTILITIES ---
+        const cleanText = (text) => {
+            if (!text) return '';
+            return text
+                .replace(/jho/gi, '') // Remove "jho"
+                .replace(/[\x00-\x1F\x7F-\x9F]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .substring(0, 400);
+        };
+
         const trimUrl = (url) => {
             if (!url) return '';
             return url
@@ -570,14 +578,6 @@ const processRecordWithHeaders = (record, headers) => {
             if (!url) return '';
             return url.replace(/^(https?:\/\/)/i, '')
                 .replace(/^www\./i, '').split('?')[0];
-        };
-
-        const cleanText = (text) => {
-            if (!text) return '';
-            return text.replace(/[\x00-\x1F\x7F-\x9F]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim()
-                .substring(0, 400);
         };
 
         // Create a record object using headers
@@ -594,10 +594,10 @@ const processRecordWithHeaders = (record, headers) => {
         }
 
         // Extract postcode from address
+        const rawAddress = cleanText(recordObj.Full_Address);
         let postcode = '';
-        const address = cleanText(recordObj.Full_Address);
-        if (address) {
-            const postcodeMatch = address.match(/[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}/i);
+        if (rawAddress) {
+            const postcodeMatch = rawAddress.match(/[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}/i);
             if (postcodeMatch) {
                 postcode = postcodeMatch[0].toUpperCase();
             }
@@ -607,25 +607,26 @@ const processRecordWithHeaders = (record, headers) => {
             return null;
         }
 
-        // Get URL from Website or URL column
-        let url = recordObj?.Website;
-        if (url) {
-            url = trimUrl(url);
-        }
-
-        // Clean address by removing the postcode
-        let cleanAddress = address;
+        // Clean address by removing the postcode and applying quote/space cleanup
+        let cleanAddress = rawAddress;
         if (cleanAddress && postcode) {
             // Remove the postcode from the address
-            cleanAddress = cleanAddress.replace(new RegExp(postcode, 'gi'), '').trim();
-            // Clean up any extra commas or spaces that might be left
-            cleanAddress = cleanAddress.replace(/,\s*,/g, ',').replace(/^,\s*/, '').replace(/\s*,$/, '').trim();
+            cleanAddress = cleanAddress.replace(new RegExp(postcode, 'gi'), '');
+            
+            // Requirement: Remove leading " and trailing space + "
+            cleanAddress = cleanAddress.replace(/^["\s]+|["\s]+$/g, '');
+            
+            // Clean up any extra commas or spaces
+            cleanAddress = cleanAddress.replace(/,\s*,/g, ',')
+                                       .replace(/^,\s*/, '')
+                                       .replace(/\s*,$/, '')
+                                       .trim();
         }
 
         const processedRecord = {
             company_name: companyName,
             postcode: postcode,
-            url: url || '',
+            url: recordObj.Website ? trimUrl(recordObj.Website) : '',
             date: new Date(),
             address: cleanAddress,
             email: cleanText(recordObj.Email),
@@ -675,10 +676,68 @@ const getCollectionStats = async () => {
     return await Botsol.countDocuments();
 };
 
+const cleanDatabase = async () => {
+    try {
+        const duplicates = await Botsol.aggregate([
+            {
+                $project: {
+                    url: { $trim: { input: { $ifNull: ["$url", ""] } } },
+                    date: 1,
+                    postcode: { $trim: { input: { $ifNull: ["$postcode", ""] } } },
+                    company_name: { $trim: { input: { $toLower: { $ifNull: ["$company_name", ""] } } } },
+                    address: { $trim: { input: { $ifNull: ["$address", ""] } } }
+                }
+            },
+            { $sort: { date: -1 } },
+            {
+                $addFields: {
+                    dedupeKey: {
+                        $switch: {
+                            branches: [
+                                {
+                                    case: { $gt: [{ $strLenCP: "$url" }, 0] },
+                                    then: { $concat: ["URL|", "$url", "|", { $toString: "$date" }, "|", "$postcode"] }
+                                },
+                                {
+                                    case: { $gt: [{ $strLenCP: "$postcode" }, 0] },
+                                    then: { $concat: ["POST|", "$company_name", "|", { $toString: "$date" }, "|", "$postcode"] }
+                                }
+                            ],
+                            default: { $concat: ["ADDR|", "$company_name", "|", { $toString: "$date" }, "|", "$address"] }
+                        }
+                    }
+                }
+            },
+            { $group: { _id: "$dedupeKey", ids: { $push: "$_id" }, count: { $sum: 1 } } },
+            { $match: { count: { $gt: 1 } } }
+        ], { allowDiskUse: true });
+
+        let allIdsToDelete = [];
+        for (const group of duplicates) {
+            allIdsToDelete.push(...group.ids.slice(1));
+        }
+
+        const chunkSize = 50000;
+        let totalDeleted = 0;
+        for (let i = 0; i < allIdsToDelete.length; i += chunkSize) {
+            const chunk = allIdsToDelete.slice(i, i + chunkSize);
+            const res = await Botsol.deleteMany({ _id: { $in: chunk } });
+            totalDeleted += res.deletedCount;
+        }
+        
+        botsolLogger.info(`Cleanup complete. Removed ${totalDeleted} duplicates.`);
+        return { success: true, removedCount: totalDeleted };
+    } catch (error) {
+        botsolLogger.error(`Cleanup failed: ${error.message}`);
+        throw error;
+    }
+};
+
 const BotsolService = {
     getImportFiles,
     getCollectionStats,
     processFile,
+    cleanDatabase,
     getImportProgress: () => ({ ...importProgressTracker }),
     resetImportProgress,
     setImportRunning
