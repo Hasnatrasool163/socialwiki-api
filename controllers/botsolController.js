@@ -300,7 +300,7 @@ const BotsolController = {
     startImport,
     getStats,
     getImportProgress,
-    getCleanData,
+    cleanData,
     getPaginatedBotsols,
     stopImport,
 };
