@@ -103,12 +103,49 @@ const generateMissingPostcodesReport = async (job) => {
         outputStream = fs.createWriteStream(job.filePath, { encoding: 'utf8' });
         outputStream.write('postcode\n');
 
+        const cursor = PostcodeDistrict.find(
+            { district: { $ne: 'NOT ACTIVE' } },
+            { _id: 0, postcode: 1 }
+        )
+            .sort({ postcode: 1 })
+            .lean()
+            .cursor({ batchSize: REPORT_BATCH_SIZE });
 
-     const cursor = PostcodeDistrict.aggregate(buildMissingPostcodesPipeline())
-    .allowDiskUse(true)
-    .cursor({ batchSize: 1000 });
+        let pendingPostcodes = [];
+        const seenPostcodes = new Set();
+        let processedRows = 0;
 
-        let missingCount = 0;
+        const flushPending = async () => {
+            if (!pendingPostcodes.length) {
+                return;
+            }
+
+            job.stage = 'checking';
+
+            const batch = pendingPostcodes;
+            pendingPostcodes = [];
+
+            const foundDocs = await AddressMain.find(
+                { postcode: { $in: batch } },
+                { _id: 0, postcode: 1 }
+            ).lean();
+
+            const foundSet = new Set(foundDocs.map((doc) => normalizePostcode(doc.postcode)));
+
+            for (const postcode of batch) {
+                if (foundSet.has(postcode)) {
+                    continue;
+                }
+
+                job.missingCount += 1;
+                await writeLine(outputStream, `${postcode}\n`);
+            }
+
+            processedRows += batch.length;
+            job.processedRows = processedRows;
+            job.stage = 'writing';
+            updateProgress(job);
+        };
 
         for await (const row of cursor) {
             const postcode = normalizePostcode(row?.postcode);
@@ -246,4 +283,10 @@ const downloadMissingPostcodesReport = async (req, res) => {
             message: 'Failed to download missing postcode report'
         });
     }
+};
+
+module.exports = {
+    startMissingPostcodesReport,
+    getMissingPostcodesReportStatus,
+    downloadMissingPostcodesReport
 };
