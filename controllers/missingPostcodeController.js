@@ -63,10 +63,10 @@ exports.downloadMissingPostcodesReport = async (req, res) => {
 
         outputStream = fs.createWriteStream(filePath, { encoding: 'utf8' });
 
-        const cursor = PostcodeDistrict.aggregate(buildMissingPostcodesPipeline())
-            .allowDiskUse(true)
-            .cursor({ batchSize: 1000 })
-            .exec();
+
+     const cursor = PostcodeDistrict.aggregate(buildMissingPostcodesPipeline())
+    .allowDiskUse(true)
+    .cursor({ batchSize: 1000 });
 
         let missingCount = 0;
 

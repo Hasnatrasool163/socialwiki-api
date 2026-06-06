@@ -1,11 +1,11 @@
 module.exports = {
   apps: [{
-    name: 'admin-backend',
+    name: 'socialwiki-api',
     script: './server.js',
     instances: 1, // or 'max' for cluster mode
     autorestart: true,
     watch: false,
-    max_memory_restart: '1G',
+    max_memory_restart: '2G',
     env_file: './.env', // Load .env file
     env: {
       NODE_ENV: 'development'

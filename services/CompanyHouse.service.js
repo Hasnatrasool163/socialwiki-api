@@ -3,13 +3,14 @@
 const { parse } = require('csv-parse');
 const fs = require('fs');
 const path = require('path');
+const mongoose = require('mongoose');
 const CompanyHouse = require('../models/CompanyHouse');
 const companyHouseLogger = require('../config/loggers/companyHouseLogger');
 const { archiveFile } = require('../utils/fileUtils');
 
 // Configuration
 // Reduced batch size for better memory and GC behavior
-const BATCH_SIZE = 2000;
+const BATCH_SIZE = 4000;
 // Number of batches to process in parallel (bounded concurrency)
 const PARALLEL_BATCHES = 2;
 const IMPORT_DIR = path.join(__dirname, '../imports/company_house/');
@@ -132,172 +133,143 @@ const processRecord = (record, index) => {
 
 // Process CSV file
 const processFile = async (filePath) => {
-    return new Promise((resolve, reject) => {
-        const filename = path.basename(filePath);
-        const records = [];
-        let processedCount = 0;
-        let skippedLines = 0;
-        
-        companyHouseLogger.info(`Starting to process file: ${filename}`);
-        importProgressTracker.currentFile = filename;
+    const filename = path.basename(filePath);
+    let processedCount = 0;
+    let skippedLines = 0;
+    let batch = [];
+    let totalInserted = 0;
 
-        const parser = parse({
-            columns: false, // Don't use headers as column names, use array indices
-            skip_empty_lines: true,
-            trim: true,
-            from_line: 2, // Skip header row 
-            relax_column_count: true
-        });
+    companyHouseLogger.info(`Starting to process file: ${filename}`);
+    importProgressTracker.currentFile = filename;
 
-        parser.on('readable', function () {
-            let record;
-            while ((record = parser.read()) !== null) {
-                const processedRecord = processRecord(record, processedCount);
-                if (processedRecord) {
-                    records.push(processedRecord);
-                } else {
-                    skippedLines++;
-                }
-                processedCount++;
+    try {
+        const db = mongoose.connection.db;
+        const currentCollectionName = CompanyHouse.collection.name;
+        const tempCollectionName = `${currentCollectionName}_tmp`;
+        const oldCollectionName = `${currentCollectionName}_old`;
+
+        // 1. GET BASELINE FOR SANITY CHECK
+        const previousCount = await CompanyHouse.countDocuments();
+        companyHouseLogger.info(`Baseline check: Live collection currently has ${previousCount} documents.`);
+
+        // 2. SETUP TEMPORARY COLLECTION & INDEXES
+	delete mongoose.models['CompanyHouseTmp'];
+	const TempCompanyHouse = mongoose.model('CompanyHouseTmp', CompanyHouse.schema, tempCollectionName);
+
+
+        companyHouseLogger.info(`Preparing temporary collection (${tempCollectionName})...`);
+        await db.collection(tempCollectionName).drop().catch(() => {}); // Ensure completely clean slate
+        await TempCompanyHouse.createCollection();
+        await TempCompanyHouse.syncIndexes(); // Ensures queries stay fast after the swap
+
+        const parser = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 })
+            .pipe(parse({
+                columns: false,
+                skip_empty_lines: true,
+                trim: true,
+                from_line: 2, 
+                relax_column_count: true
+            }));
+
+        // 3. PROCESS ON-THE-FLY
+        for await (const record of parser) {
+            const processedRecord = processRecord(record, processedCount);
+            
+            if (processedRecord) {
+                batch.push(processedRecord);
+            } else {
+                skippedLines++;
             }
-        });
+            
+            processedCount++;
+            importProgressTracker.processed = processedCount;
 
-        parser.on('error', function (error) {
-            const errorMessage = `CSV parsing error (continuing with valid lines): ${error.message}`;
-            companyHouseLogger.warn(`Error in ${filename}: ${errorMessage}`);
+            // Progress Logging (Visibility for 2.7GB file)
+            if (processedCount % 100000 === 0) {
+                companyHouseLogger.info(`Processed ${processedCount.toLocaleString()} rows...`);
+            }
 
-            skippedLines++;
-            importProgressTracker.errors.push({
-                filename,
-                error: errorMessage
-            });
-        });
+            // 4. INSERT BATCH
+            if (batch.length >= BATCH_SIZE) {
+                try {
+                    const result = await TempCompanyHouse.insertMany(batch, { ordered: false });
+                    totalInserted += result.length;
+                } catch (err) {
+                    const insertedThisBatch = err.insertedDocs ? err.insertedDocs.length : (err.insertedCount || 0);
+                    totalInserted += insertedThisBatch;
+                    companyHouseLogger.warn(`Batch warning: Inserted ${insertedThisBatch}/${batch.length}. Error: ${err.message}`);
+                }
+                importProgressTracker.upserted = totalInserted;
+                batch = []; 
+            }
+        }
 
-        parser.on('end', async function () {
+        // 5. INSERT REMAINING RECORDS
+        if (batch.length > 0) {
             try {
-                companyHouseLogger.info(`Parsed ${records.length} valid records from ${filename} (skipped ${skippedLines} invalid lines)`);
-                // Set total so frontend can compute progress percentage
-                importProgressTracker.total = records.length;
-                
-                if (records.length === 0) {
-                    companyHouseLogger.warn(`No valid records found in ${filename}`);
-                    await moveCompletedFile(filePath);
-                    resolve({ processed: 0, upserted: 0, modified: 0 });
-                    return;
-                }
-
-                // Process records in batches
-                let totalUpserted = 0;
-                let totalModified = 0;
-
-                // Convert records array into batches queue
-                const batches = [];
-                for (let i = 0; i < records.length; i += BATCH_SIZE) {
-                    batches.push(records.slice(i, i + BATCH_SIZE));
-                }
-
-                // Simple bounded concurrency worker
-                let active = 0;
-                let idx = 0;
-                const results = { upserted: 0, modified: 0 };
-
-                const runNext = async () => {
-                    if (idx >= batches.length) return;
-                    const batch = batches[idx++];
-                    active++;
-                    const start = Date.now();
-                    try {
-                        const bulkOps = batch.map(doc => ({
-                            updateOne: {
-                                filter: { CompanyNumber: doc.CompanyNumber },
-                                update: { $set: doc },
-                                upsert: true
-                            }
-                        }));
-
-                        // Use unordered bulkWrite with relaxed writeConcern for throughput
-                        const result = await CompanyHouse.bulkWrite(bulkOps, {
-                            ordered: false,
-                            writeConcern: { w: 1 },
-                            bypassDocumentValidation: true
-                        });
-
-                        const elapsed = Date.now() - start;
-                        const up = result.upsertedCount || 0;
-                        const mod = result.modifiedCount || 0;
-
-                        results.upserted += up;
-                        results.modified += mod;
-
-                        importProgressTracker.processed += batch.length;
-                        importProgressTracker.upserted += up;
-                        importProgressTracker.modified += mod;
-
-                        companyHouseLogger.info(`Batch processed (size=${batch.length}) upserted=${up} modified=${mod} time=${elapsed}ms`);
-                    } catch (err) {
-                        companyHouseLogger.error(`Error processing batch in ${filename}: ${err.message}`);
-                        importProgressTracker.errors.push({ filename, error: `Batch processing error: ${err.message}` });
-                        // On duplicate key errors, try individual upserts
-                        if (err && err.code === 11000) {
-                            companyHouseLogger.warn('Duplicate key error encountered, retrying batch item-by-item');
-                            for (const doc of batch) {
-                                try {
-                                    const r = await CompanyHouse.updateOne({ CompanyNumber: doc.CompanyNumber }, { $set: doc }, { upsert: true });
-                                    if (r.upsertedCount && r.upsertedCount > 0) results.upserted++;
-                                    if (r.modifiedCount && r.modifiedCount > 0) results.modified++;
-                                } catch (uerr) {
-                                    companyHouseLogger.warn(`Failed individual upsert for ${doc.CompanyNumber}: ${uerr.message}`);
-                                    importProgressTracker.errors.push({ filename, error: `Failed upsert ${doc.CompanyNumber}: ${uerr.message}` });
-                                }
-                            }
-                        }
-                    } finally {
-                        active--;
-                        // Start next batch if any
-                        if (idx < batches.length) {
-                            // If we have spare capacity, start another
-                            if (active < PARALLEL_BATCHES) runNext();
-                        }
-                    }
-                };
-
-                // Start initial workers
-                const starters = Math.min(PARALLEL_BATCHES, batches.length);
-                const starterPromises = [];
-                for (let s = 0; s < starters; s++) {
-                    starterPromises.push(runNext());
-                }
-
-                // Wait until all batches processed
-                while (idx < batches.length || active > 0) {
-                    // small delay to avoid busy loop
-                    // eslint-disable-next-line no-await-in-loop
-                    await new Promise(res => setTimeout(res, 100));
-                }
-
-                totalUpserted += results.upserted;
-                totalModified += results.modified;
-
-                await moveCompletedFile(filePath);
-                
-                companyHouseLogger.info(`Completed processing ${filename}: ${totalUpserted} upserted, ${totalModified} modified`);
-                resolve({ processed: records.length, upserted: totalUpserted, modified: totalModified });
-
-            } catch (error) {
-                companyHouseLogger.error(`Error saving records from ${filename}: ${error.message}`);
-                importProgressTracker.errors.push({
-                    filename,
-                    error: `Database error: ${error.message}`
-                });
-                reject(error);
+                const result = await TempCompanyHouse.insertMany(batch, { ordered: false });
+                totalInserted += result.length;
+            } catch (err) {
+                const insertedThisBatch = err.insertedDocs ? err.insertedDocs.length : (err.insertedCount || 0);
+                totalInserted += insertedThisBatch;
             }
-        });
+            importProgressTracker.upserted = totalInserted;
+        }
 
-        // Use streams with smaller chunks for better memory management
-        fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 }) // 1MB chunks
-            .pipe(parser);
-    });
+        // 6. VALIDATE IMPORT COMPLETION
+        const finalTempCount = await TempCompanyHouse.countDocuments();
+        companyHouseLogger.info(`Temp collection contains ${finalTempCount} documents. Tracked inserts: ${totalInserted}`);
+
+        if (Math.abs(finalTempCount - totalInserted) > 100) {
+            throw new Error(`Inserted count mismatch! Expected around ${totalInserted}, but DB has ${finalTempCount}.`);
+        }
+
+        // Sanity Check: Ensure we didn't just import a broken/empty file
+        if (previousCount > 0 && finalTempCount < previousCount * 0.9) {
+            throw new Error(`Import aborted to protect live data. Imported count (${finalTempCount}) is suspiciously lower than previous month (${previousCount}).`);
+        }
+
+        // 7. ATOMIC SWAP (Safe Rename)
+	companyHouseLogger.info(`Import validated. Performing atomic collection swap...`);
+
+try {
+    // 1. Rename existing live to old (Backup)
+    await db.collection(currentCollectionName).rename(oldCollectionName, { dropTarget: true });
+
+    try {
+        // 2. Rename temp to live
+        await db.collection(tempCollectionName).rename(currentCollectionName);
+    } catch (renameErr) {
+        // ROLLBACK: If step 2 fails, put the backup back to live
+        companyHouseLogger.error(`CRITICAL: Rename failed! Rolling back backup...`);
+        await db.collection(oldCollectionName).rename(currentCollectionName);
+        throw new Error(`Swap failed. Rollback executed: ${renameErr.message}`);
+    }
+} catch (err) {
+    throw new Error(`Collection swap failed: ${err.message}`);
+}
+        
+        companyHouseLogger.info(`Collection swap successful! Processed ${processedCount} rows. Removed ${skippedLines} invalid lines.`);
+        
+        importProgressTracker.total = processedCount;
+        await moveCompletedFile(filePath);
+
+        return { 
+            processed: processedCount, 
+            inserted: finalTempCount, 
+            modified: 0 
+        };
+
+    } catch (error) {
+        companyHouseLogger.error(`Critical Error processing ${filename}: ${error.message}`);
+        importProgressTracker.errors.push({
+            filename,
+            error: `Critical error: ${error.message}`
+        });
+        throw error; // Rethrow to let the controller handle the failure
+    }
 };
+
 
 const getImportFiles = async () => {
     try {
