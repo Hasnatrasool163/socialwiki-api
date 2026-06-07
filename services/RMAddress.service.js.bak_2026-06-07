@@ -112,33 +112,6 @@ const normalizePostcode = (value) => {
     return compact;
 };
 
-const normalizeSearchPostcode = (value) => {
-    if (!value) return '';
-
-    let clean = value
-        .toString()
-        .trim()
-        .toUpperCase()
-        .replace(/[^A-Z0-9 ]/g, '')
-        .replace(/\s+/g, ' ');
-
-    if (!clean) return '';
-
-    const continuousText = clean.replace(/\s/g, '');
-
-    const fullPostcodeNoSpaceRegex =
-        /^([A-Z]{1,2}[0-9][A-Z0-9]?)([0-9][A-Z]{2})$/;
-
-    if (fullPostcodeNoSpaceRegex.test(continuousText)) {
-        return continuousText.replace(
-            fullPostcodeNoSpaceRegex,
-            '$1 $2'
-        );
-    }
-
-    return clean;
-};
-
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const outwardCode = (postcode) => {
@@ -394,28 +367,6 @@ const getStats = async () => {
     };
 };
 
-const buildPostcodePrefixQuery = (value) => {
-    const normalized = normalizeSearchPostcode(value);
-    if (!normalized) return null;
-    return {
-        $gte: normalized,
-        $lt: `${normalized}\uffff`
-    };
-};
-
-const encodeCursorToken = (payload) => Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
-
-const decodeCursorToken = (cursor) => {
-    if (!cursor) return null;
-    try {
-        const decoded = JSON.parse(Buffer.from(String(cursor), 'base64').toString('utf8'));
-        if (!decoded || typeof decoded !== 'object') return null;
-        return decoded;
-    } catch (error) {
-        return null;
-    }
-};
-
 const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistrict, searchAddress, useCursor = true, cursor = null }) => {
     const safePage = Number.isFinite(page) && page > 0 ? page : 1;
     const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 1000) : 200;
@@ -428,18 +379,11 @@ const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistri
     const trimmedAddress = (searchAddress || '').trim();
 
     if (trimmedPostcode) {
-        const postcodeQuery = buildPostcodePrefixQuery(trimmedPostcode);
-        if (postcodeQuery) {
-            query.postcode = postcodeQuery;
-        }
+        query.postcode = { $regex: `^${escapeRegex(trimmedPostcode)}`, $options: 'i' };
     }
 
     if (trimmedDistrict) {
-        const normalizedDistrict = trimmedDistrict.toUpperCase();
-        query.district = {
-            $gte: normalizedDistrict,
-            $lt: `${normalizedDistrict}\uffff`
-        };
+        query.district = { $regex: `^${escapeRegex(trimmedDistrict)}`, $options: 'i' };
     }
 
     if (trimmedAddress) {
@@ -451,38 +395,19 @@ const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistri
 
     if (useCursor) {
         const cursorQuery = { ...query };
-
-        if (trimmedPostcode) {
-            const cursorData = decodeCursorToken(cursor);
-
-            if (cursorData?.postcode && cursorData?._id) {
-              cursorQuery.$or = [
-                    { postcode: { $gt: cursorData.postcode } },
-                    {
-                        postcode: cursorData.postcode,
-                        _id: { $gt: new mongoose.Types.ObjectId(cursorData._id) }
-                    }
-                ];
-            }
-        } else if (cursor && mongoose.isValidObjectId(cursor)) {
+        if (cursor && mongoose.isValidObjectId(cursor)) {
             cursorQuery._id = { $gt: cursor };
         }
 
         const cursorRows = await AddressMasterMerged.find(cursorQuery)
             .select({ postcode: 1, district: 1, address: 1, dateCreated: 1, correctionVersion: 1, exceptionVersion: 1 })
-            .sort(trimmedPostcode ? { postcode: 1, _id: 1 } : { _id: 1 })
+            .sort({ _id: 1 })
             .limit(safeLimit + 1)
             .lean();
 
         const hasNextPage = cursorRows.length > safeLimit;
         rows = hasNextPage ? cursorRows.slice(0, safeLimit) : cursorRows;
-        
-        const lastRow = rows[rows.length - 1] || null;
-        const nextCursor = hasNextPage && lastRow
-            ? (trimmedPostcode
-                ? encodeCursorToken({ postcode: lastRow.postcode, _id: String(lastRow._id || '') })
-                : String(lastRow._id || ''))
-            : null
+        const nextCursor = hasNextPage ? String(rows[rows.length - 1]?._id || '') : null;
 
         pagination = {
             mode: 'cursor',
@@ -497,7 +422,7 @@ const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistri
         const [offsetRows, total] = await Promise.all([
             AddressMasterMerged.find(query)
                 .select({ postcode: 1, district: 1, address: 1, dateCreated: 1, correctionVersion: 1, exceptionVersion: 1 })
-                .sort(trimmedPostcode ? { postcode: 1, _id: 1 } : { _id: 1 })
+                .sort({ _id: 1 })
                 .skip(skip)
                 .limit(safeLimit)
                 .lean(),
@@ -514,11 +439,7 @@ const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistri
             total,
             totalPages: Math.ceil(total / safeLimit),
             hasNextPage: safePage * safeLimit < total,
-            nextCursor: rows.length
-                ? (trimmedPostcode
-                    ? encodeCursorToken({ postcode: rows[rows.length - 1]?.postcode, _id: String(rows[rows.length - 1]?._id || '') })
-                    : String(rows[rows.length - 1]?._id || ''))
-                : null
+            nextCursor: rows.length ? String(rows[rows.length - 1]?._id || '') : null
         };
     }
 
