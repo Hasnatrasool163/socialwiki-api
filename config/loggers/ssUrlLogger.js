@@ -15,12 +15,17 @@ const ssUrlFormat = winston.format.combine(
         format: 'YYYY-MM-DD HH:mm:ss'
     }),
     winston.format.errors({ stack: true }),
-    winston.format.printf(({ timestamp, level, message, url, image, reason }) => {
+    winston.format.printf(({ timestamp, level, message, url, image, reason, ...meta }) => {
         let logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
 
         if (url) logMessage += ` | URL: ${url}`;
         if (image) logMessage += ` | Image: ${image}`;
         if (reason) logMessage += ` | Reason: ${reason}`;
+
+        const metaKeys = Object.keys(meta || {});
+        if (metaKeys.length > 0) {
+            logMessage += ` | Meta: ${JSON.stringify(meta)}`;
+        }
 
         return logMessage;
     })

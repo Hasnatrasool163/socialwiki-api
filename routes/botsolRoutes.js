@@ -10,6 +10,7 @@ router.get('/import-progress', BotsolController.getImportProgress);
 // Protected routes (auth required)
 router.post('/import', BotsolController.startImport);
 router.post('/stop-import', BotsolController.stopImport);
+router.post('/clean-data', BotsolController.cleanData);
 
 router.get('/stats', BotsolController.getStats);
 router.get('/paginated', BotsolController.getPaginatedBotsols);

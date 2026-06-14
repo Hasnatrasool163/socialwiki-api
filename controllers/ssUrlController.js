@@ -210,14 +210,6 @@ const importSSUrl = async (req, res) => {
                     let batchDuplicates = 0;
                     let batchOtherErrors = 0;
 
-                    ssUrlLogger.info('Batch insert error', {
-                        errorName: error.name,
-                        errorCode: error.code,
-                        isBulkWriteError,
-                        writeErrorCount: writeErrors.length,
-                        entriesToInsertCount: entriesToInsert.length
-                    });
-
                     // If it's a BulkWriteError, process all write errors
                     if (isBulkWriteError && writeErrors.length > 0) {
                         // Count successful inserts
@@ -282,13 +274,28 @@ const importSSUrl = async (req, res) => {
                         });
                     }
 
-                    ssUrlLogger.info('Batch insert result', {
-                        currentBatchSuccess,
-                        batchDuplicates,
-                        batchOtherErrors,
-                        totalSuccessCount: successCount + currentBatchSuccess,
-                        totalDuplicateCount: duplicateCount + batchDuplicates
-                    });
+                    // Keep PM2 output clean: duplicate-only batches are expected with unordered inserts.
+                    if (batchOtherErrors > 0) {
+                        ssUrlLogger.warn('Batch insert completed with non-duplicate write errors', {
+                            errorName: error.name,
+                            errorCode: error.code,
+                            isBulkWriteError,
+                            writeErrorCount: writeErrors.length,
+                            entriesToInsertCount: entriesToInsert.length,
+                            currentBatchSuccess,
+                            batchDuplicates,
+                            batchOtherErrors,
+                            totalSuccessCount: successCount + currentBatchSuccess,
+                            totalDuplicateCount: duplicateCount + batchDuplicates
+                        });
+                    } else if (batchDuplicates > 0) {
+                        ssUrlLogger.debug('Batch insert had duplicate rows only', {
+                            currentBatchSuccess,
+                            batchDuplicates,
+                            totalSuccessCount: successCount + currentBatchSuccess,
+                            totalDuplicateCount: duplicateCount + batchDuplicates
+                        });
+                    }
 
                     successCount += currentBatchSuccess;
                     duplicateCount += batchDuplicates;

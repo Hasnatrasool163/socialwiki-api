@@ -47,6 +47,10 @@ router.get('/import-progress', RMAddressController.getImportProgress);
 router.get('/stats', RMAddressController.getStats);
 router.get('/paginated', RMAddressController.getPaginatedAddresses);
 router.get('/import-files', RMAddressController.listImportFiles);
+router.get('/export/preview', RMAddressController.exportPreview);
+router.post('/export/start', RMAddressController.startExport);
+router.get('/export/status/:jobId', RMAddressController.getExportStatus);
+router.get('/export/download/:jobId', RMAddressController.downloadExport);
 
 router.post('/upload-files', (req, res, next) => {
 	upload.array('files', 50)(req, res, (error) => {
@@ -61,5 +65,8 @@ router.post('/upload-files', (req, res, next) => {
 }, RMAddressController.uploadImportFiles);
 router.post('/import', RMAddressController.startImport);
 router.post('/stop-import', RMAddressController.stopImport);
+router.post('/import-csv', (req, res, next) => { upload.single('file')(req, res, (err) => { if (err) return res.status(400).json({ success: false, message: err.message }); return next(); }); }, RMAddressController.importCsv);
+router.put('/:id', RMAddressController.editRecord);
+router.post('/bulk-edit', RMAddressController.bulkEdit);
 
 module.exports = router;

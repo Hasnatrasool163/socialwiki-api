@@ -78,6 +78,113 @@ const startImport = async (req, res) => {
     }
 };
 
+const exportPreview = async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit, 10) || 500;
+        const rows = await RMAddressService.searchForExport({
+            searchPostcode: req.query.searchPostcode || '',
+            searchDistrict: req.query.searchDistrict || '',
+            searchAddress: req.query.searchAddress || '',
+            limit
+        });
+
+        return res.json({ success: true, count: rows.length, rows });
+    } catch (error) {
+        rmAddressLogger.error(`Error in exportPreview: ${error.message}`);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+};
+
+const startExport = async (req, res) => {
+    try {
+        const payload = req.body || {};
+        const jobId = String(Date.now());
+
+        // Kick off background export job using service helper to build query
+        (async () => {
+            try {
+                await RMAddressService.exportJobStarter({ searchPostcode: payload.searchPostcode, searchDistrict: payload.searchDistrict, searchAddress: payload.searchAddress, jobId });
+            } catch (err) {
+                rmAddressLogger.error(`Export job ${jobId} failed: ${err.message}`);
+            }
+        })();
+
+        return res.status(202).json({ success: true, message: 'Export started', jobId, statusUrl: `/api/rm-address/export/status/${jobId}` });
+    } catch (error) {
+        rmAddressLogger.error(`Error starting export: ${error.message}`);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+};
+
+const getExportStatus = async (req, res) => {
+    try {
+        const jobId = req.params.jobId;
+        const status = RMAddressService.getExportStatus ? RMAddressService.getExportStatus(jobId) : null;
+        if (!status) return res.status(404).json({ success: false, message: 'Job not found' });
+        return res.json({ success: true, status });
+    } catch (error) {
+        rmAddressLogger.error(`Error getting export status: ${error.message}`);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+};
+
+const downloadExport = async (req, res) => {
+    try {
+        const jobId = req.params.jobId;
+        const status = RMAddressService.getExportStatus ? RMAddressService.getExportStatus(jobId) : null;
+        if (!status || !status.filePath) return res.status(404).json({ success: false, message: 'Export file not available' });
+        return res.download(status.filePath);
+    } catch (error) {
+        rmAddressLogger.error(`Error downloading export: ${error.message}`);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+};
+
+const importCsv = async (req, res) => {
+    try {
+        const files = req.files || [];
+        if (!files.length) return res.status(400).json({ success: false, message: 'No CSV file uploaded' });
+        const file = files[0];
+        // Start import in background to avoid long request
+        (async () => {
+            try {
+                await RMAddressService.importFromCsv({ filePath: file.path });
+            } catch (err) {
+                rmAddressLogger.error(`Import CSV failed for ${file.path}: ${err.message}`);
+            }
+        })();
+
+        return res.status(202).json({ success: true, message: 'Import started', file: file.filename });
+    } catch (error) {
+        rmAddressLogger.error(`Error in importCsv: ${error.message}`);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+};
+
+const editRecord = async (req, res) => {
+    try {
+        const id = req.params.id;
+        const data = req.body || {};
+        const result = await RMAddressService.updateRecord(id, data);
+        return res.json({ success: true, result });
+    } catch (error) {
+        rmAddressLogger.error(`Error editing record: ${error.message}`);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+};
+
+const bulkEdit = async (req, res) => {
+    try {
+        const edits = req.body.edits || [];
+        if (!Array.isArray(edits) || !edits.length) return res.status(400).json({ success: false, message: 'No edits provided' });
+        const result = await RMAddressService.bulkApplyEdits(edits);
+        return res.json({ success: true, result });
+    } catch (error) {
+        rmAddressLogger.error(`Error bulk editing records: ${error.message}`);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+};
+
 const getImportProgress = async (req, res) => {
     try {
         const data = RMAddressService.getImportProgress();
@@ -214,5 +321,13 @@ module.exports = {
         uploadImportFiles,
         getPaginatedAddresses,
         stopImport
+        ,
+        exportPreview,
+        startExport,
+        getExportStatus,
+        downloadExport,
+        importCsv,
+        editRecord,
+        bulkEdit
     }
 };
