@@ -320,8 +320,7 @@ module.exports = {
         listImportFiles,
         uploadImportFiles,
         getPaginatedAddresses,
-        stopImport
-        ,
+        stopImport,
         exportPreview,
         startExport,
         getExportStatus,

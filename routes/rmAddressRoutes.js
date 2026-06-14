@@ -27,12 +27,11 @@ const upload = multer({
 	storage,
 	fileFilter: (req, file, cb) => {
 		const isCsvName = (file.originalname || '').toLowerCase().endsWith('.csv');
-		const isCsvMime = (file.mimetype || '').toLowerCase().includes('csv') || (file.mimetype || '') === 'text/plain';
+		const isCsvMime =
+			(file.mimetype || '').toLowerCase().includes('csv') ||
+			(file.mimetype || '') === 'text/plain';
 
-		if (isCsvName || isCsvMime) {
-			cb(null, true);
-			return;
-		}
+		if (isCsvName || isCsvMime) return cb(null, true);
 
 		cb(new Error('Only CSV files are allowed.'));
 	},
@@ -42,30 +41,52 @@ const upload = multer({
 	}
 });
 
-// BASE URL: /api/rm-address
+// BASE: /api/rm-address
+
 router.get('/import-progress', RMAddressController.getImportProgress);
 router.get('/stats', RMAddressController.getStats);
 router.get('/paginated', RMAddressController.getPaginatedAddresses);
 router.get('/import-files', RMAddressController.listImportFiles);
+
 router.get('/export/preview', RMAddressController.exportPreview);
-router.post('/export/start', RMAddressController.startExport);
 router.get('/export/status/:jobId', RMAddressController.getExportStatus);
 router.get('/export/download/:jobId', RMAddressController.downloadExport);
 
-router.post('/upload-files', (req, res, next) => {
-	upload.array('files', 50)(req, res, (error) => {
-		if (error) {
-			return res.status(400).json({
-				success: false,
-				message: error.message || 'Invalid upload request'
-			});
-		}
-		return next();
-	});
-}, RMAddressController.uploadImportFiles);
+router.post(
+	'/upload-files',
+	(req, res, next) => {
+		upload.array('files', 50)(req, res, (error) => {
+			if (error) {
+				return res.status(400).json({
+					success: false,
+					message: error.message || 'Invalid upload request'
+				});
+			}
+			return next();
+		});
+	},
+	RMAddressController.uploadImportFiles
+);
+
+router.post('/export/start', RMAddressController.startExport);
 router.post('/import', RMAddressController.startImport);
 router.post('/stop-import', RMAddressController.stopImport);
-router.post('/import-csv', (req, res, next) => { upload.single('file')(req, res, (err) => { if (err) return res.status(400).json({ success: false, message: err.message }); return next(); }); }, RMAddressController.importCsv);
+
+router.post(
+	'/import-csv',
+	(req, res, next) => {
+		upload.single('file')(req, res, (err) => {
+			if (err)
+				return res.status(400).json({
+					success: false,
+					message: err.message
+				});
+			return next();
+		});
+	},
+	RMAddressController.importCsv
+);
+
 router.put('/:id', RMAddressController.editRecord);
 router.post('/bulk-edit', RMAddressController.bulkEdit);
 

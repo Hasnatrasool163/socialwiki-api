@@ -89,8 +89,9 @@ app.use('/api/adult-keywords', verifyToken, authorizeRoles('admin'), adultKeywor
 app.use('/api/company-house', verifyToken, authorizeRoles('admin'), companyHouseRoutes);
 app.use('/api/postcode-district', verifyToken, authorizeRoles('admin'), postcodeDistrictRoutes);
 app.use('/api/reports', verifyToken, authorizeRoles('admin'), reportRoutes);
-app.use('/api/rm-address', verifyToken, authorizeRoles('admin'), rmAddressRoutes);
 app.use('/api/prop-price', verifyToken, authorizeRoles('admin'), propPriceRoutes);
+
+app.use('/api/rm-address', rmAddressRoutes);
 
 // ✅ admin-only route example
 app.get('/admin', verifyToken, authorizeRoles('admin'), (req, res) => {
