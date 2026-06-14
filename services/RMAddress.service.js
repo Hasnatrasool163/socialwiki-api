@@ -3,7 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const mongoose = require('mongoose');
 
-const AddressMasterMerged = require('../models/AddressMasterMerged');
+// const AddressMasterMerged = require('../models/AddressMasterMerged');
+const AddressMasterMerged = require('../models/AddressMasterMergedTest');
+
 const PostcodeDistrict = require('../models/PostcodeDistrict');
 const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 
