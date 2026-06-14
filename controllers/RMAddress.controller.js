@@ -1,7 +1,8 @@
 const path = require('path');
 const fs = require('fs');
-const { RMAddressService, IMPORT_DIR } = require('../services/RMAddress.service');
+const { RMAddressService, IMPORT_DIR, EXPORT_HARD_LIMIT } = require('../services/RMAddress.service');
 const rmAddressLogger = require('../config/loggers/rmAddressLogger');
+
 
 const processFiles = async (files) => {
     try {
@@ -17,10 +18,7 @@ const processFiles = async (files) => {
                 await RMAddressService.processFile(filePath);
             } catch (error) {
                 rmAddressLogger.error(`Error processing ${file}: ${error.message}`);
-                RMAddressService.addImportError({
-                    filename: file,
-                    error: error.message
-                });
+                RMAddressService.addImportError({ filename: file, error: error.message });
             }
         }
 
@@ -29,13 +27,8 @@ const processFiles = async (files) => {
         rmAddressLogger.info('RM Address import process completed');
     } catch (error) {
         rmAddressLogger.error(`RM Address processFiles error: ${error.message}`);
-
         RMAddressService.setImportComplete(true);
-        RMAddressService.addImportError({
-            filename: 'process',
-            error: `Process failed: ${error.message}`
-        });
-
+        RMAddressService.addImportError({ filename: 'process', error: `Process failed: ${error.message}` });
         RMAddressService.setImportRunning(false);
     }
 };
@@ -66,21 +59,18 @@ const startImport = async (req, res) => {
             RMAddressService.setImportRunning(false);
         });
 
-        return res.json({
-            success: true,
-            message: 'RM Address import started',
-            files,
-            totalFiles: files.length
-        });
+        return res.json({ success: true, message: 'RM Address import started', files, totalFiles: files.length });
     } catch (error) {
         rmAddressLogger.error(`Error starting RM Address import: ${error.message}`);
         return res.status(500).json({ success: false, error: error.message });
     }
 };
 
+
 const exportPreview = async (req, res) => {
     try {
-        const limit = parseInt(req.query.limit, 10) || 500;
+        const limit = Math.min(parseInt(req.query.limit, 10) || 500, 500);
+
         const rows = await RMAddressService.searchForExport({
             searchPostcode: req.query.searchPostcode || '',
             searchDistrict: req.query.searchDistrict || '',
@@ -98,18 +88,42 @@ const exportPreview = async (req, res) => {
 const startExport = async (req, res) => {
     try {
         const payload = req.body || {};
+
+        const hasFilter =
+            (payload.searchPostcode || '').trim() ||
+            (payload.searchDistrict || '').trim() ||
+            (payload.searchAddress || '').trim();
+
+        if (!hasFilter) {
+            return res.status(400).json({
+                success: false,
+                message: 'Export requires at least one search filter (address, postcode, or district).'
+            });
+        }
+
         const jobId = String(Date.now());
 
-        // Kick off background export job using service helper to build query
+        res.status(202).json({
+            success: true,
+            message: 'Export started',
+            jobId,
+            hardLimit: EXPORT_HARD_LIMIT,
+            statusUrl: `/api/rm-address/export/status/${jobId}`
+        });
+
         (async () => {
             try {
-                await RMAddressService.exportJobStarter({ searchPostcode: payload.searchPostcode, searchDistrict: payload.searchDistrict, searchAddress: payload.searchAddress, jobId });
+                await RMAddressService.exportJobStarter({
+                    searchPostcode: payload.searchPostcode,
+                    searchDistrict: payload.searchDistrict,
+                    searchAddress: payload.searchAddress,
+                    jobId,
+                    hardLimit: EXPORT_HARD_LIMIT   
+                });
             } catch (err) {
                 rmAddressLogger.error(`Export job ${jobId} failed: ${err.message}`);
             }
         })();
-
-        return res.status(202).json({ success: true, message: 'Export started', jobId, statusUrl: `/api/rm-address/export/status/${jobId}` });
     } catch (error) {
         rmAddressLogger.error(`Error starting export: ${error.message}`);
         return res.status(500).json({ success: false, error: error.message });
@@ -119,7 +133,7 @@ const startExport = async (req, res) => {
 const getExportStatus = async (req, res) => {
     try {
         const jobId = req.params.jobId;
-        const status = RMAddressService.getExportStatus ? RMAddressService.getExportStatus(jobId) : null;
+        const status = RMAddressService.getExportStatus(jobId);
         if (!status) return res.status(404).json({ success: false, message: 'Job not found' });
         return res.json({ success: true, status });
     } catch (error) {
@@ -131,8 +145,13 @@ const getExportStatus = async (req, res) => {
 const downloadExport = async (req, res) => {
     try {
         const jobId = req.params.jobId;
-        const status = RMAddressService.getExportStatus ? RMAddressService.getExportStatus(jobId) : null;
-        if (!status || !status.filePath) return res.status(404).json({ success: false, message: 'Export file not available' });
+        const status = RMAddressService.getExportStatus(jobId);
+        if (!status || !status.filePath) {
+            return res.status(404).json({ success: false, message: 'Export file not available' });
+        }
+        if (status.status !== 'done') {
+            return res.status(409).json({ success: false, message: `Export is not complete (status: ${status.status})` });
+        }
         return res.download(status.filePath);
     } catch (error) {
         rmAddressLogger.error(`Error downloading export: ${error.message}`);
@@ -140,12 +159,14 @@ const downloadExport = async (req, res) => {
     }
 };
 
+
 const importCsv = async (req, res) => {
     try {
         const files = req.files || [];
         if (!files.length) return res.status(400).json({ success: false, message: 'No CSV file uploaded' });
+
         const file = files[0];
-        // Start import in background to avoid long request
+
         (async () => {
             try {
                 await RMAddressService.importFromCsv({ filePath: file.path });
@@ -160,6 +181,7 @@ const importCsv = async (req, res) => {
         return res.status(500).json({ success: false, error: error.message });
     }
 };
+
 
 const editRecord = async (req, res) => {
     try {
@@ -176,7 +198,9 @@ const editRecord = async (req, res) => {
 const bulkEdit = async (req, res) => {
     try {
         const edits = req.body.edits || [];
-        if (!Array.isArray(edits) || !edits.length) return res.status(400).json({ success: false, message: 'No edits provided' });
+        if (!Array.isArray(edits) || !edits.length) {
+            return res.status(400).json({ success: false, message: 'No edits provided' });
+        }
         const result = await RMAddressService.bulkApplyEdits(edits);
         return res.json({ success: true, result });
     } catch (error) {
@@ -184,6 +208,7 @@ const bulkEdit = async (req, res) => {
         return res.status(500).json({ success: false, error: error.message });
     }
 };
+
 
 const getImportProgress = async (req, res) => {
     try {
@@ -218,12 +243,8 @@ const listImportFiles = async (req, res) => {
 const uploadImportFiles = async (req, res) => {
     try {
         const files = req.files || [];
-
         if (!files.length) {
-            return res.status(400).json({
-                success: false,
-                message: 'No CSV files were uploaded.'
-            });
+            return res.status(400).json({ success: false, message: 'No CSV files were uploaded.' });
         }
 
         const uploadedFiles = files.map((file) => ({
@@ -233,15 +254,9 @@ const uploadImportFiles = async (req, res) => {
         }));
 
         rmAddressLogger.info(`Uploaded ${uploadedFiles.length} RM Address file(s)`);
-
         const pending = await RMAddressService.getImportFileDetails();
 
-        return res.json({
-            success: true,
-            message: 'CSV file(s) uploaded successfully.',
-            uploadedFiles,
-            data: pending
-        });
+        return res.json({ success: true, message: 'CSV file(s) uploaded successfully.', uploadedFiles, data: pending });
     } catch (error) {
         rmAddressLogger.error(`Error uploading RM Address files: ${error.message}`);
 
@@ -249,11 +264,7 @@ const uploadImportFiles = async (req, res) => {
             await Promise.all(
                 req.files.map(async (file) => {
                     if (!file?.path) return;
-                    try {
-                        await fs.promises.unlink(file.path);
-                    } catch (cleanupError) {
-                        rmAddressLogger.warn(`Failed to cleanup uploaded file ${file.path}: ${cleanupError.message}`);
-                    }
+                    try { await fs.promises.unlink(file.path); } catch {}
                 })
             );
         }
@@ -279,11 +290,7 @@ const getPaginatedAddresses = async (req, res) => {
             searchAddress: req.query.searchAddress || ''
         });
 
-        return res.json({
-            success: true,
-            data: rows,
-            pagination
-        });
+        return res.json({ success: true, data: rows, pagination });
     } catch (error) {
         rmAddressLogger.error(`Error getting RM Address paginated data: ${error.message}`);
         return res.status(500).json({ success: false, error: error.message });
@@ -293,12 +300,8 @@ const getPaginatedAddresses = async (req, res) => {
 const stopImport = async (req, res) => {
     try {
         const currentProgress = RMAddressService.getImportProgress();
-
         if (!currentProgress.isRunning || currentProgress.isComplete) {
-            return res.status(400).json({
-                success: false,
-                message: 'No RM Address import is currently running.'
-            });
+            return res.status(400).json({ success: false, message: 'No RM Address import is currently running.' });
         }
 
         RMAddressService.setImportRunning(false);

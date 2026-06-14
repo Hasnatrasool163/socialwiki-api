@@ -3,9 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const mongoose = require('mongoose');
 
-// const AddressMasterMerged = require('../models/AddressMasterMerged');
 const AddressMasterMerged = require('../models/AddressMasterMergedTest');
-
 const PostcodeDistrict = require('../models/PostcodeDistrict');
 const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 
@@ -14,6 +12,8 @@ const EXPORT_DIR = path.join(__dirname, '../exports/rm_address/');
 const BATCH_SIZE = 5000;
 const MAX_FILES_PER_RUN = 1000;
 const MAX_SKIPPED_SAMPLES = 20;
+
+const EXPORT_HARD_LIMIT = 500;
 
 const importProgressTracker = {
     currentFile: null,
@@ -61,8 +61,7 @@ const buildAdjacentRegex = (phrase) => {
     return new RegExp(`\\b${parts.join('[,\\s]+')}\\b`, 'i');
 };
 
-
-const searchForExport = async ({ searchPostcode = '', searchDistrict = '', searchAddress = '', limit = 500 }) => {
+const buildSearchQuery = ({ searchPostcode = '', searchDistrict = '', searchAddress = '' }) => {
     const query = {};
     const trimmedPostcode = (searchPostcode || '').trim();
     const trimmedDistrict = (searchDistrict || '').trim();
@@ -70,8 +69,6 @@ const searchForExport = async ({ searchPostcode = '', searchDistrict = '', searc
 
     if (trimmedPostcode) {
         const clean = normalizeSearchPostcode(trimmedPostcode);
-        const noSpace = clean.replace(/\s/g, '');
-
         const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
         if (fullPostcodeRegex.test(clean)) {
             query.postcode = clean;
@@ -91,96 +88,115 @@ const searchForExport = async ({ searchPostcode = '', searchDistrict = '', searc
         if (phraseRegex) query.address = { $regex: phraseRegex };
     }
 
+    return query;
+};
+
+const searchForExport = async ({ searchPostcode = '', searchDistrict = '', searchAddress = '', limit = 500 }) => {
+    const safeLimit = Math.min(Number.isFinite(limit) ? limit : 500, 500);
+    const query = buildSearchQuery({ searchPostcode, searchDistrict, searchAddress });
+
     const rows = await AddressMasterMerged.find(query)
         .select({ postcode: 1, district: 1, address: 1, dateCreated: 1, correctionVersion: 1, exceptionVersion: 1 })
         .sort({ postcode: 1, _id: 1 })
-        .limit(limit)
+        .limit(safeLimit)
         .lean();
 
     return rows;
 };
 
-const exportToCsvAndDelete = async ({ query, jobId }) => {
+const exportToCsvAndDelete = async ({ query, jobId, hardLimit = EXPORT_HARD_LIMIT }) => {
     await ensureExportDirectory();
     const filename = `rm_address_export_${jobId}.csv`;
     const filePath = path.join(EXPORT_DIR, filename);
     const outStream = fs.createWriteStream(filePath, { flags: 'w' });
 
-    exportJobs[jobId] = { status: 'running', filePath: null, processed: 0, deleted: 0, error: null };
+    exportJobs[jobId] = { status: 'running', filePath: null, processed: 0, deleted: 0, error: null, hardLimit };
 
     try {
-        // write header
-        outStream.write(['id', 'postcode', 'district', 'address', 'dateCreated', 'correctionVersion', 'exceptionVersion'].map(csvEscape).join(',') + '\n');
+        const docsToProcess = await AddressMasterMerged.find(query)
+            .select({ postcode: 1, district: 1, address: 1, dateCreated: 1, correctionVersion: 1, exceptionVersion: 1 })
+            .sort({ postcode: 1, _id: 1 })
+            .limit(hardLimit)          
+            .lean();
 
-        const cursor = AddressMasterMerged.find(query).lean().cursor();
-        const deleteIdsBatch = [];
-        let processed = 0;
+        rmAddressLogger.info(`Export job ${jobId}: found ${docsToProcess.length} docs to export (hardLimit=${hardLimit})`);
 
-        for await (const doc of cursor) {
-            processed += 1;
-            const addressText = (typeof doc.address === 'string' && doc.address.startsWith('['))
-                ? (() => { try { const p = JSON.parse(doc.address); return Array.isArray(p) ? p.join(', ') : doc.address; } catch (e) { return doc.address; } })()
-                : doc.address;
-
-            const row = [String(doc._id || ''), doc.postcode || '', doc.district || '', addressText || '', doc.dateCreated || '', doc.correctionVersion || '', doc.exceptionVersion || ''];
-            outStream.write(row.map(csvEscape).join(',') + '\n');
-
-            deleteIdsBatch.push(doc._id);
-
-            if (deleteIdsBatch.length >= BATCH_SIZE) {
-                await AddressMasterMerged.deleteMany({ _id: { $in: deleteIdsBatch } });
-                exportJobs[jobId].deleted += deleteIdsBatch.length;
-                deleteIdsBatch.length = 0;
-            }
-
-            exportJobs[jobId].processed = processed;
+        if (!docsToProcess.length) {
+            outStream.end();
+            exportJobs[jobId].status = 'done';
+            exportJobs[jobId].filePath = filePath;
+            return { filePath, processed: 0, deleted: 0 };
         }
 
-        if (deleteIdsBatch.length) {
-            await AddressMasterMerged.deleteMany({ _id: { $in: deleteIdsBatch } });
-            exportJobs[jobId].deleted += deleteIdsBatch.length;
+        outStream.write(
+            ['id', 'postcode', 'district', 'address', 'dateCreated', 'correctionVersion', 'exceptionVersion']
+                .map(csvEscape)
+                .join(',') + '\n'
+        );
+
+        const idsToDelete = [];
+
+        for (const doc of docsToProcess) {
+            let addressText = doc.address;
+            if (typeof doc.address === 'string' && doc.address.startsWith('[')) {
+                try {
+                    const parsed = JSON.parse(doc.address);
+                    if (Array.isArray(parsed)) addressText = parsed.join(', ');
+                } catch (e) {
+                }
+            }
+
+            const row = [
+                String(doc._id || ''),
+                doc.postcode || '',
+                doc.district || '',
+                addressText || '',
+                doc.dateCreated || '',
+                doc.correctionVersion || '',
+                doc.exceptionVersion || ''
+            ];
+            outStream.write(row.map(csvEscape).join(',') + '\n');
+
+            idsToDelete.push(doc._id);
+            exportJobs[jobId].processed += 1;
+        }
+
+        for (let i = 0; i < idsToDelete.length; i += BATCH_SIZE) {
+            const batch = idsToDelete.slice(i, i + BATCH_SIZE);
+            await AddressMasterMerged.deleteMany({ _id: { $in: batch } });
+            exportJobs[jobId].deleted += batch.length;
+            rmAddressLogger.info(`Export job ${jobId}: deleted batch of ${batch.length}`);
         }
 
         outStream.end();
         exportJobs[jobId].status = 'done';
         exportJobs[jobId].filePath = filePath;
-        return { filePath, processed: exportJobs[jobId].processed, deleted: exportJobs[jobId].deleted };
+
+        rmAddressLogger.info(`Export job ${jobId} complete: processed=${exportJobs[jobId].processed}, deleted=${exportJobs[jobId].deleted}`);
+
+        return {
+            filePath,
+            processed: exportJobs[jobId].processed,
+            deleted: exportJobs[jobId].deleted
+        };
     } catch (error) {
         exportJobs[jobId].status = 'failed';
         exportJobs[jobId].error = error.message;
         try { outStream.destroy(); } catch (e) {}
+        rmAddressLogger.error(`Export job ${jobId} failed: ${error.message}`);
         throw error;
     }
 };
 
-const exportJobStarter = async ({ searchPostcode = '', searchDistrict = '', searchAddress = '', jobId }) => {
-    const query = {};
-    const trimmedPostcode = (searchPostcode || '').trim();
-    const trimmedDistrict = (searchDistrict || '').trim();
-    const trimmedAddress = (searchAddress || '').trim();
+const exportJobStarter = async ({ searchPostcode = '', searchDistrict = '', searchAddress = '', jobId, hardLimit = EXPORT_HARD_LIMIT }) => {
+    const query = buildSearchQuery({ searchPostcode, searchDistrict, searchAddress });
 
-  if (trimmedPostcode) {
-        const clean = normalizeSearchPostcode(trimmedPostcode);
-        const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
-        if (fullPostcodeRegex.test(clean)) {
-            query.postcode = clean;
-        } else {
-            const prefix = clean.toUpperCase();
-            query.postcode = { $gte: prefix, $lt: `${prefix}\uffff` };
-        }
+    const hasFilter = Object.keys(query).length > 0;
+    if (!hasFilter) {
+        throw new Error('Export requires at least one search filter (address, postcode, or district).');
     }
 
-    if (trimmedDistrict) {
-        const normalizedDistrict = trimmedDistrict.toUpperCase();
-        query.district = { $gte: normalizedDistrict, $lt: `${normalizedDistrict}\uffff` };
-    }
-
-    if (trimmedAddress) {
-        const phraseRegex = buildAdjacentRegex(trimmedAddress);
-        if (phraseRegex) query.address = { $regex: phraseRegex };
-    }
-
-    return exportToCsvAndDelete({ query, jobId });
+    return exportToCsvAndDelete({ query, jobId, hardLimit });
 };
 
 const getExportStatus = (jobId) => {
@@ -191,7 +207,14 @@ const importFromCsv = async ({ filePath }) => {
     const filename = path.basename(filePath);
     rmAddressLogger.info(`Starting import from CSV: ${filename}`);
 
-    const parser = parse({ columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, relax_quotes: true });
+    const parser = parse({
+        columns: true,          
+        skip_empty_lines: true,
+        trim: true,
+        relax_column_count: true,
+        relax_quotes: true
+    });
+
     const stream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 }).pipe(parser);
 
     let batch = [];
@@ -206,28 +229,42 @@ const importFromCsv = async ({ filePath }) => {
             continue;
         }
 
-        const district = record.district || record.District || await resolveDistrict(postcode);
+
+        let district = (record.district || record.District || '').trim().toUpperCase();
+        if (!district) {
+            district = await resolveDistrict(postcode);
+        }
         if (!district) {
             skipped += 1;
             continue;
         }
 
-        const addressRaw = record.address || record.Address || record.address_json || '';
+
+        const addressRaw = (record.address || record.Address || '').trim();
         let addressParts = [];
-        if (record.address_json) {
-            try { const parsed = JSON.parse(record.address_json); if (Array.isArray(parsed)) addressParts = parsed; }
-            catch (e) { addressParts = [String(record.address_json)]; }
+
+        if (addressRaw) {
+            addressParts = addressRaw.split(', ').map((s) => s.trim()).filter(Boolean);
         }
 
-        if (!addressParts.length && addressRaw) {
-            // split by comma to try to get parts
-            addressParts = String(addressRaw).split(',').map((s) => s.trim()).filter(Boolean);
+        const standardized = standardizeAddressParts(addressParts, postcode, district);
+        if (!standardized.length) {
+            skipped += 1;
+            continue;
         }
 
-        const addressCanonical = JSON.stringify(standardizeAddressParts(addressParts, postcode, district));
+        const addressCanonical = JSON.stringify(standardized);
         const dateCreated = record.dateCreated || getDateCreated();
 
-        batch.push({ postcode, district, address: addressCanonical, dateCreated, correctionVersion: record.correctionVersion || 'v1', exceptionVersion: record.exceptionVersion });
+        batch.push({
+            postcode,
+            district,
+            address: addressCanonical,
+            dateCreated,
+            correctionVersion: record.correctionVersion || 'v1',
+            exceptionVersion: record.exceptionVersion || undefined
+        });
+
         processed += 1;
 
         if (batch.length >= BATCH_SIZE) {
@@ -238,6 +275,7 @@ const importFromCsv = async ({ filePath }) => {
 
     if (batch.length) await flushBatch(batch, filename);
 
+    rmAddressLogger.info(`Import from CSV complete: ${filename} processed=${processed}, skipped=${skipped}`);
     return { processed, skipped };
 };
 
@@ -245,9 +283,6 @@ const updateRecord = async (id, data) => {
     const update = { ...data };
     if (update.postcode) update.postcode = normalizePostcode(update.postcode);
     if (update.address && Array.isArray(update.address)) update.address = JSON.stringify(update.address);
-    if (update.address && typeof update.address === 'string' && update.address.startsWith('[')) {
-        // assume canonical
-    }
 
     const result = await AddressMasterMerged.updateOne({ _id: id }, { $set: update });
     return result;
@@ -257,13 +292,17 @@ const bulkApplyEdits = async (edits) => {
     if (!Array.isArray(edits) || !edits.length) return { processed: 0 };
     const ops = [];
     for (const e of edits) {
-        const filter = e._id ? { _id: e._id } : (e.postcode && e.address ? { postcode: normalizePostcode(e.postcode), address: e.address } : null);
+        const filter = e._id
+            ? { _id: e._id }
+            : (e.postcode && e.address ? { postcode: normalizePostcode(e.postcode), address: e.address } : null);
         if (!filter) continue;
+
         const update = { $set: {} };
         if (e.postcode) update.$set.postcode = normalizePostcode(e.postcode);
         if (e.district) update.$set.district = e.district;
         if (e.address) update.$set.address = typeof e.address === 'string' ? e.address : JSON.stringify(e.address);
         if (Object.keys(update.$set).length === 0) continue;
+
         ops.push({ updateOne: { filter, update, upsert: false } });
     }
 
@@ -272,6 +311,7 @@ const bulkApplyEdits = async (edits) => {
     const result = await AddressMasterMerged.bulkWrite(ops, { ordered: false });
     return { processed: result.nModified || result.modifiedCount || 0 };
 };
+
 
 const ensureImportDirectory = async () => {
     await fs.promises.mkdir(IMPORT_DIR, { recursive: true });
@@ -290,26 +330,15 @@ const resetImportProgress = () => {
     importProgressTracker.isRunning = false;
 };
 
-const setImportRunning = (running) => {
-    importProgressTracker.isRunning = running;
-};
-
+const setImportRunning = (running) => { importProgressTracker.isRunning = running; };
 const setImportComplete = (complete) => {
     importProgressTracker.isComplete = complete;
-    if (complete) {
-        importProgressTracker.currentFile = null;
-    }
+    if (complete) importProgressTracker.currentFile = null;
 };
-
-const addImportError = (error) => {
-    importProgressTracker.errors.push(error);
-};
+const addImportError = (error) => { importProgressTracker.errors.push(error); };
 
 const previewRecord = (record) => {
-    if (!Array.isArray(record)) {
-        return '';
-    }
-
+    if (!Array.isArray(record)) return '';
     return record
         .map((field) => (field || '').toString().replace(/[\r\n]+/g, ' ').trim())
         .filter(Boolean)
@@ -321,12 +350,7 @@ const logSkippedRow = (filename, reason, record) => {
     const rowPreview = previewRecord(record);
     rmAddressLogger.warn(`Skipped row in ${filename}: ${reason}${rowPreview ? ` | row=${rowPreview}` : ''}`);
 
-    importProgressTracker.skippedSamples.unshift({
-        filename,
-        reason,
-        rowPreview
-    });
-
+    importProgressTracker.skippedSamples.unshift({ filename, reason, rowPreview });
     if (importProgressTracker.skippedSamples.length > MAX_SKIPPED_SAMPLES) {
         importProgressTracker.skippedSamples.length = MAX_SKIPPED_SAMPLES;
     }
@@ -340,50 +364,27 @@ const getDateCreated = () => {
     return `${dd}/${mm}/${yyyy}`;
 };
 
+
 const normalizePostcode = (value) => {
     if (!value) return '';
-
-    const compact = value
-        .toString()
-        .trim()
-        .toUpperCase()
-        .replace(/\s+/g, ' ')
-        .replace(/[^A-Z0-9 ]/g, '');
-
+    const compact = value.toString().trim().toUpperCase().replace(/\s+/g, ' ').replace(/[^A-Z0-9 ]/g, '');
     if (!compact) return '';
-
     const noSpace = compact.replace(/\s+/g, '');
     if (noSpace.length > 3) {
         return `${noSpace.slice(0, noSpace.length - 3)} ${noSpace.slice(noSpace.length - 3)}`;
     }
-
     return compact;
 };
 
 const normalizeSearchPostcode = (value) => {
     if (!value) return '';
-
-    let clean = value
-        .toString()
-        .trim()
-        .toUpperCase()
-        .replace(/[^A-Z0-9 ]/g, '')
-        .replace(/\s+/g, ' ');
-
+    let clean = value.toString().trim().toUpperCase().replace(/[^A-Z0-9 ]/g, '').replace(/\s+/g, ' ');
     if (!clean) return '';
-
     const continuousText = clean.replace(/\s/g, '');
-
-    const fullPostcodeNoSpaceRegex =
-        /^([A-Z]{1,2}[0-9][A-Z0-9]?)([0-9][A-Z]{2})$/;
-
+    const fullPostcodeNoSpaceRegex = /^([A-Z]{1,2}[0-9][A-Z0-9]?)([0-9][A-Z]{2})$/;
     if (fullPostcodeNoSpaceRegex.test(continuousText)) {
-        return continuousText.replace(
-            fullPostcodeNoSpaceRegex,
-            '$1 $2'
-        );
+        return continuousText.replace(fullPostcodeNoSpaceRegex, '$1 $2');
     }
-
     return clean;
 };
 
@@ -396,21 +397,15 @@ const outwardCode = (postcode) => {
 
 const cleanPart = (value) => {
     if (!value) return '';
-    return value
-        .toString()
-        .replace(/[\u0000-\u001F\u007F-\u009F]/g, '')
-        .trim();
+    return value.toString().replace(/[\u0000-\u001F\u007F-\u009F]/g, '').trim();
 };
 
 const getAddressParts = (record) => {
     if (!Array.isArray(record) || record.length < 2) return [];
-
     const rawParts = record.length > 2 ? record.slice(1) : [record[1]];
-
     if (rawParts.length === 1 && typeof rawParts[0] === 'string' && rawParts[0].includes(',')) {
         return rawParts[0].split(',').map((entry) => entry.trim());
     }
-
     return rawParts.map((entry) => cleanPart(entry));
 };
 
@@ -433,7 +428,6 @@ const standardizeAddressParts = (parts, postcode, district) => {
             deduped.push(part);
         }
     }
-
     return deduped;
 };
 
@@ -454,7 +448,7 @@ const resolveDistrict = async (postcode) => {
 const flushBatch = async (docs, filename) => {
     if (!docs.length) return;
 
-    const canonicalOps = docs.map((doc) => ({
+    const ops = docs.map((doc) => ({
         updateOne: {
             filter: { postcode: doc.postcode, address: doc.address },
             update: { $set: doc },
@@ -462,25 +456,20 @@ const flushBatch = async (docs, filename) => {
         }
     }));
 
-    const canonicalResult = await AddressMasterMerged.bulkWrite(canonicalOps, {
-        ordered: false,
-        writeConcern: { w: 1 }
-    });
+    const result = await AddressMasterMerged.bulkWrite(ops, { ordered: false, writeConcern: { w: 1 } });
 
-    const upsertedCount = canonicalResult.upsertedCount || 0;
-    const modifiedCount = canonicalResult.modifiedCount || 0;
+    importProgressTracker.upserted += result.upsertedCount || 0;
+    importProgressTracker.modified += result.modifiedCount || 0;
 
-    importProgressTracker.upserted += upsertedCount;
-    importProgressTracker.modified += modifiedCount;
-
-    rmAddressLogger.info(`Batch processed for ${filename}: rows=${docs.length}, upserted=${upsertedCount}, modified=${modifiedCount}`);
+    rmAddressLogger.info(
+        `Batch processed for ${filename}: rows=${docs.length}, upserted=${result.upsertedCount || 0}, modified=${result.modifiedCount || 0}`
+    );
 };
 
 const moveCompletedFile = async (filePath) => {
     const filename = path.basename(filePath);
     const today = new Date().toISOString().split('T')[0];
     const completedDir = path.join(IMPORT_DIR, `completed_${today}`);
-
     await fs.promises.mkdir(completedDir, { recursive: true });
     await fs.promises.rename(filePath, path.join(completedDir, filename));
 };
@@ -541,10 +530,7 @@ const processFile = async (filePath) => {
         if (!district) {
             importProgressTracker.skipped += 1;
             logSkippedRow(filename, `district not found for postcode ${postcode}`, record);
-            importProgressTracker.errors.push({
-                filename,
-                error: `District not found for postcode ${postcode}`
-            });
+            importProgressTracker.errors.push({ filename, error: `District not found for postcode ${postcode}` });
             continue;
         }
 
@@ -556,14 +542,11 @@ const processFile = async (filePath) => {
             continue;
         }
 
-        const canonicalAddress = JSON.stringify(addressParts);
-        const dateCreated = getDateCreated();
-
         batch.push({
             postcode,
             district,
-            address: canonicalAddress,
-            dateCreated,
+            address: JSON.stringify(addressParts),
+            dateCreated: getDateCreated(),
             correctionVersion: 'v1',
             exceptionVersion: undefined
         });
@@ -576,20 +559,14 @@ const processFile = async (filePath) => {
         }
     }
 
-    if (batch.length > 0) {
-        await flushBatch(batch, filename);
-    }
-
-    if (importProgressTracker.isRunning) {
-        await moveCompletedFile(filePath);
-    }
+    if (batch.length > 0) await flushBatch(batch, filename);
+    if (importProgressTracker.isRunning) await moveCompletedFile(filePath);
 
     rmAddressLogger.info(`Completed RM Address import file: ${filename}`);
 };
 
 const getImportFiles = async () => {
     await ensureImportDirectory();
-
     const entries = await fs.promises.readdir(IMPORT_DIR, { withFileTypes: true });
     const csvFiles = entries
         .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.csv'))
@@ -597,15 +574,13 @@ const getImportFiles = async () => {
         .sort((a, b) => a.localeCompare(b));
 
     if (csvFiles.length > MAX_FILES_PER_RUN) {
-        rmAddressLogger.warn(`Found ${csvFiles.length} files, limiting processing to first ${MAX_FILES_PER_RUN} files`);
+        rmAddressLogger.warn(`Found ${csvFiles.length} files, limiting to ${MAX_FILES_PER_RUN}`);
     }
-
     return csvFiles.slice(0, MAX_FILES_PER_RUN);
 };
 
 const getImportFileDetails = async () => {
     await ensureImportDirectory();
-
     const entries = await fs.promises.readdir(IMPORT_DIR, { withFileTypes: true });
     const csvEntries = entries
         .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.csv'))
@@ -615,7 +590,6 @@ const getImportFileDetails = async () => {
         csvEntries.map(async (entry) => {
             const fullPath = path.join(IMPORT_DIR, entry.name);
             const stats = await fs.promises.stat(fullPath);
-
             return {
                 filename: entry.name,
                 sizeBytes: stats.size,
@@ -626,29 +600,18 @@ const getImportFileDetails = async () => {
     );
 
     detailedFiles.sort((a, b) => a.filename.localeCompare(b.filename));
-
-    return {
-        files: detailedFiles,
-        pendingCount: detailedFiles.length,
-        importEnabled: detailedFiles.length > 0
-    };
+    return { files: detailedFiles, pendingCount: detailedFiles.length, importEnabled: detailedFiles.length > 0 };
 };
 
 const getStats = async () => {
     const addressMasterMergedCount = await AddressMasterMerged.estimatedDocumentCount();
-
-    return {
-        addressMasterMergedCount
-    };
+    return { addressMasterMergedCount };
 };
 
 const buildPostcodePrefixQuery = (value) => {
     const clean = value.toString().trim().toUpperCase().replace(/\s+/g, '');
     if (!clean) return null;
-    return {
-        $regex: `^${escapeRegex(clean)}`, 
-        $options: 'i'
-    };
+    return { $regex: `^${escapeRegex(clean)}`, $options: 'i' };
 };
 
 const encodeCursorToken = (payload) => Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
@@ -670,24 +633,18 @@ const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistri
     const skip = (safePage - 1) * safeLimit;
 
     const query = {};
-
     const trimmedPostcode = (searchPostcode || '').trim();
     const trimmedDistrict = (searchDistrict || '').trim();
     const trimmedAddress = (searchAddress || '').trim();
 
     if (trimmedPostcode) {
         const postcodeQuery = buildPostcodePrefixQuery(trimmedPostcode);
-        if (postcodeQuery) {
-            query.postcode = postcodeQuery;
-        }
+        if (postcodeQuery) query.postcode = postcodeQuery;
     }
 
     if (trimmedDistrict) {
         const normalizedDistrict = trimmedDistrict.toUpperCase();
-        query.district = {
-            $gte: normalizedDistrict,
-            $lt: `${normalizedDistrict}\uffff`
-        };
+        query.district = { $gte: normalizedDistrict, $lt: `${normalizedDistrict}\uffff` };
     }
 
     if (trimmedAddress) {
@@ -702,14 +659,10 @@ const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistri
 
         if (trimmedPostcode) {
             const cursorData = decodeCursorToken(cursor);
-
             if (cursorData?.postcode && cursorData?._id) {
-              cursorQuery.$or = [
+                cursorQuery.$or = [
                     { postcode: { $gt: cursorData.postcode } },
-                    {
-                        postcode: cursorData.postcode,
-                        _id: { $gt: new mongoose.Types.ObjectId(cursorData._id) }
-                    }
+                    { postcode: cursorData.postcode, _id: { $gt: new mongoose.Types.ObjectId(cursorData._id) } }
                 ];
             }
         } else if (cursor && mongoose.isValidObjectId(cursor)) {
@@ -724,23 +677,15 @@ const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistri
 
         const hasNextPage = cursorRows.length > safeLimit;
         rows = hasNextPage ? cursorRows.slice(0, safeLimit) : cursorRows;
-        
+
         const lastRow = rows[rows.length - 1] || null;
         const nextCursor = hasNextPage && lastRow
             ? (trimmedPostcode
                 ? encodeCursorToken({ postcode: lastRow.postcode, _id: String(lastRow._id || '') })
                 : String(lastRow._id || ''))
-            : null
+            : null;
 
-        pagination = {
-            mode: 'cursor',
-            limit: safeLimit,
-            hasNextPage,
-            nextCursor,
-            total: null,
-            totalPages: null,
-            page: null
-        };
+        pagination = { mode: 'cursor', limit: safeLimit, hasNextPage, nextCursor, total: null, totalPages: null, page: null };
     } else {
         const [offsetRows, total] = await Promise.all([
             AddressMasterMerged.find(query)
@@ -775,24 +720,15 @@ const getPaginatedAddresses = async ({ page, limit, searchPostcode, searchDistri
         if (typeof row.address === 'string' && row.address.startsWith('[')) {
             try {
                 const parsed = JSON.parse(row.address);
-                if (Array.isArray(parsed)) {
-                    addressText = parsed.join(', ');
-                }
+                if (Array.isArray(parsed)) addressText = parsed.join(', ');
             } catch (error) {
                 addressText = row.address;
             }
         }
-
-        return {
-            ...row,
-            address: addressText
-        };
+        return { ...row, address: addressText };
     });
 
-    return {
-        rows: mappedRows,
-        pagination
-    };
+    return { rows: mappedRows, pagination };
 };
 
 module.exports = {
@@ -813,8 +749,10 @@ module.exports = {
         getExportStatus,
         importFromCsv,
         updateRecord,
-        bulkApplyEdits
+        bulkApplyEdits,
+        EXPORT_HARD_LIMIT
     },
     IMPORT_DIR,
-    EXPORT_DIR
+    EXPORT_DIR,
+    EXPORT_HARD_LIMIT
 };
