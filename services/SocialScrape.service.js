@@ -524,7 +524,7 @@ const getBlacklistFiles = async () => {
     try {
         await ensureImportDirectory();
         const files = await fs.promises.readdir(BLACKLIST_DIR);
-        return files.filter(file => file.endsWith('.csv'));
+        return files.filter(file => file.endsWith('.csv') || file.endsWith('.txt'));
     } catch (error) {
         socialScrapeLogger.error('Error reading blacklist directory:', error);
         throw new Error('Failed to read blacklist directory');
@@ -534,7 +534,6 @@ const getBlacklistFiles = async () => {
 
 const processBlacklistFile = async (filePath, urlColumn, processId) => {
     try {
-        // Get or create progress tracker for this process
         let progressTracker = blacklistProgressStore.get(processId);
         if (!progressTracker) {
             progressTracker = {
@@ -549,7 +548,6 @@ const processBlacklistFile = async (filePath, urlColumn, processId) => {
             blacklistProgressStore.set(processId, progressTracker);
         }
 
-        // Reset progress for new file
         progressTracker.currentFile = path.basename(filePath);
         progressTracker.processed = 0;
         progressTracker.total = 0;
@@ -558,127 +556,106 @@ const processBlacklistFile = async (filePath, urlColumn, processId) => {
         progressTracker.errors = [];
         progressTracker.isComplete = false;
 
-        // Create logs directory if it doesn't exist
         const logsDir = path.join(process.cwd(), 'logs', 'social_scrape');
         await fs.promises.mkdir(logsDir, { recursive: true });
         const logFile = path.join(logsDir, 'blacklisted_logs.log');
 
         const fileContent = await fs.promises.readFile(filePath, 'utf-8');
-        const records = fileContent.split('\n').filter(line => line.trim());
+        const records = fileContent.split(/\r?\n/).filter(line => line.trim());
         progressTracker.total = records.length;
 
-        // Log start of processing
-        await fs.promises.appendFile(logFile, `\n[${new Date().toISOString()}] Starting processing of file: ${path.basename(filePath)}\n`);
+        await fs.promises.appendFile(logFile, `\n[${new Date().toISOString()}] Starting secure bulk processing: ${path.basename(filePath)}\n`);
+
+        const seenRecords = new Set();
+        let bulkOps = [];
+        const BATCH_SIZE = 1000;
+
+        // HARDENED: Isolated batch flushing utility to insulate imports from errors
+        const flushBatch = async () => {
+            if (bulkOps.length === 0) return;
+
+            try {
+                const result = await SocialScrape.bulkWrite(bulkOps, { ordered: false });
+                
+                // Track standard successful runs
+                progressTracker.upserted += result.upsertedCount || 0;
+                progressTracker.modified += (result.modifiedCount || 0) + ((result.matchedCount || 0) - (result.modifiedCount || 0));
+            } catch (bulkError) {
+                // Unordered batches populate bulkError.result with entries that succeeded before/during errors
+                if (bulkError.result) {
+                    const partialResult = bulkError.result;
+                    progressTracker.upserted += partialResult.upsertedCount || 0;
+                    progressTracker.modified += (partialResult.modifiedCount || 0) + ((partialResult.matchedCount || 0) - (partialResult.modifiedCount || 0));
+                }
+
+                // Parse out concrete details if specific items within the batch failed validation
+                if (bulkError.writeErrors) {
+                    bulkError.writeErrors.forEach(e => {
+                        progressTracker.errors.push(`Row error at index ${e.index}: ${e.errmsg}`);
+                    });
+                    await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] Batch completed with ${bulkError.writeErrors.length} individual write errors.\n`);
+                } else {
+                    progressTracker.errors.push(`Batch execution error: ${bulkError.message}`);
+                    await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] Batch encountered structural error: ${bulkError.message}\n`);
+                }
+            } finally {
+                // CRITICAL: Guaranteed cleanup ensures memory drops items so processing never deadlocks
+                progressTracker.processed += bulkOps.length;
+                bulkOps = []; 
+            }
+        };
 
         for (const record of records) {
             try {
-                const columns = record.split(',');
-                if (columns.length < urlColumn) {
-                    const errorMsg = `Invalid record format: ${record}`;
-                    progressTracker.errors.push(errorMsg);
-                    await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] ${errorMsg}\n`);
-                    continue;
+                const regex = /^(\d{2}\/\d{2}\/\d{4})[\s,]+\d{2}:\d{2}:\d{2}[\s,]+(https?:\/\/[^\s,]+)/i;
+                const match = record.match(regex);
+
+                if (!match) continue; // Safely bypass headers
+
+                const [, dateStr, rawUrl] = match;
+                const [day, month, year] = dateStr.split('/');
+                const parsedDate = new Date(Number(year), Number(month) - 1, Number(day), 0, 0, 0, 0);
+
+                let url;
+                try {
+                    url = new URL(rawUrl).hostname.replace(/^www\./i, '').toLowerCase();
+                } catch (e) {
+                    continue; // Skip individual broken URLs
                 }
 
-                let url = columns[urlColumn - 1].trim();
-                if (!url) {
-                    const errorMsg = `Empty URL in record: ${record}`;
-                    progressTracker.errors.push(errorMsg);
-                    await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] ${errorMsg}\n`);
-                    continue;
-                }
+                if (!isValidDomain(url)) continue;
 
-                // Clean the URL
-                url = url
-                    .replace(/^(https?:\/\/)/i, '')
-                    .replace(/^www\./i, '')
-                    .replace(/^([^/]+).*?$/, '$1')
-                    .toLowerCase();
+                const dateKey = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+                const uniqueKey = `${url}:${dateKey}`;
+                
+                if (seenRecords.has(uniqueKey)) continue;
+                seenRecords.add(uniqueKey);
 
-                if (!isValidDomain(url)) {
-                    const errorMsg = `Invalid domain format: ${url}`;
-                    progressTracker.errors.push(errorMsg);
-                    await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] ${errorMsg}\n`);
-                    continue;
-                }
-
-                // Parse date from the 0 column (first column) - extract only date, ignore time
-                let parsedDate = new Date(); // Default to current date
-                if (columns[0] && columns[0].trim()) {
-                    try {
-                        const dateStr = columns[0].trim();
-
-                        // Extract only the date part (before any space)
-                        const dateOnly = dateStr.split(' ')[0];
-
-                        // Handle date formats: "03/08/2025" or "03-08-2025"
-                        const parts = dateOnly.includes('-') ? dateOnly.split('-') : dateOnly.split('/');
-                        if (parts.length === 3) {
-                            // Convert to YYYY-MM-DD format for proper Date parsing
-                            const isoDate = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
-                            parsedDate = new Date(isoDate);
-
-                            // Validate the parsed date
-                            if (isNaN(parsedDate.getTime())) {
-                                await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] Invalid date format in column 0: "${dateStr}", using current date\n`);
-
-                                parsedDate = new Date();
-                            }
-                        } else {
-                            await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] Invalid date format in column 0: "${dateStr}", using current date\n`);
-                            parsedDate = new Date();
-                        }
-                    } catch (dateError) {
-                        await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] Error parsing date from column 0: "${columns[0]}", using current date. Error: ${dateError.message}\n`);
-                        parsedDate = new Date();
-                    }
-                }
-
-                // Create a new document with the parsed date
-                const defaultDoc = {
-                    url,
-                    date: parsedDate
-                };
-
-                // Search by both URL and date for more precise matching
-                const result = await SocialScrape.findOneAndUpdate(
-                    {
-                        url: url,
-                        date: parsedDate
-                    },
-                    {
-                        $set: {
-                            is_blacklisted: true
+                bulkOps.push({
+                    updateOne: {
+                        filter: { url: url, date: parsedDate },
+                        update: {
+                            $set: { is_blacklisted: true },
+                            $setOnInsert: { url: url, date: parsedDate }
                         },
-                        $setOnInsert: defaultDoc
-                    },
-                    {
-                        upsert: true,
-                        new: true,
-                        setDefaultsOnInsert: true
+                        upsert: true
                     }
-                );
+                });
 
-
-                if (result.isNew) {
-                    progressTracker.upserted++;
-                    await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] Inserted new record for URL: ${url} with date: ${parsedDate.toISOString().split('T')[0]}\n`);
-                } else if (result.isModified('is_blacklisted')) {
-                    progressTracker.modified++;
-                    await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] Updated blacklist status for URL: ${url} with date: ${parsedDate.toISOString().split('T')[0]}\n`);
+                // Flush when the batch hits limit threshold
+                if (bulkOps.length >= BATCH_SIZE) {
+                    await flushBatch();
                 }
 
-                progressTracker.processed++;
-                // blacklistEventEmitter.emit('progress', { processId, ...progressTracker });
-
-            } catch (error) {
-                const errorMsg = `Error processing record: ${error.message}`;
-                progressTracker.errors.push(errorMsg);
-                await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] ${errorMsg}\n`);
+            } catch (rowError) {
+                progressTracker.errors.push(`Line parsing exception: ${rowError.message}`);
             }
         }
 
-        // Archive the file after processing
+        // Flush out remaining trailing operations cleanly
+        await flushBatch();
+
+        // Archive raw file
         const archiveDir = path.join(process.cwd(), 'imports', 'social_scrape_blacklisted', 'completed_' + new Date().toISOString().split('T')[0]);
         await archiveFile(filePath, {
             archiveDir,
@@ -687,18 +664,16 @@ const processBlacklistFile = async (filePath, urlColumn, processId) => {
             prefix: 'blacklist'
         });
 
-        // Log completion
-        await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] Processing completed. Processed: ${progressTracker.processed}, Upserted: ${progressTracker.upserted}, Modified: ${progressTracker.modified}, Errors: ${progressTracker.errors.length}\n`);
+        await fs.promises.appendFile(logFile, `[${new Date().toISOString()}] File completely parsed. Processed: ${progressTracker.processed} | Upserted: ${progressTracker.upserted} | Modified: ${progressTracker.modified} | Total Errors Logged: ${progressTracker.errors.length}\n`);
 
         progressTracker.isComplete = true;
-        // blacklistEventEmitter.emit('progress', { processId, ...progressTracker });
 
     } catch (error) {
-        const errorMsg = `Error processing blacklist file: ${error.message}`;
-        socialScrapeLogger.error(errorMsg);
+        socialScrapeLogger.error(`Fatal crash inside Blacklist importer engine: ${error.message}`);
         throw error;
     }
 };
+
 
 const getCollectionStats = async () => {
     return await SocialScrape.countDocuments();

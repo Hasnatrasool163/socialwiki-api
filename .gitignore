@@ -11,6 +11,7 @@ logs/**/*.gz
 # Keep the logs directory structure
 !logs/.gitkeep
 !logs/**/.gitkeep
+logs/**/*.log*
 
 # Imports - Ignore files but keep directories
 imports/*
@@ -18,7 +19,7 @@ imports/*
 imports/*/*
 !imports/.gitkeep
 !imports/*/.gitkeep
-
+*.csv
 
 update/
 update/*
