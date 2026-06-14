@@ -162,23 +162,39 @@ const downloadExport = async (req, res) => {
 
 const importCsv = async (req, res) => {
     try {
-        const files = req.files || [];
-        if (!files.length) return res.status(400).json({ success: false, message: 'No CSV file uploaded' });
+        const file = req.file;
 
-        const file = files[0];
+        if (!file) {
+            return res.status(400).json({
+                success: false,
+                message: 'No CSV file uploaded'
+            });
+        }
 
         (async () => {
             try {
-                await RMAddressService.importFromCsv({ filePath: file.path });
+                await RMAddressService.importFromCsv({
+                    filePath: file.path
+                });
             } catch (err) {
-                rmAddressLogger.error(`Import CSV failed for ${file.path}: ${err.message}`);
+                rmAddressLogger.error(
+                    `Import CSV failed for ${file.path}: ${err.message}`
+                );
             }
         })();
 
-        return res.status(202).json({ success: true, message: 'Import started', file: file.filename });
+        return res.status(202).json({
+            success: true,
+            message: 'Import started',
+            file: file.filename
+        });
+
     } catch (error) {
         rmAddressLogger.error(`Error in importCsv: ${error.message}`);
-        return res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
 };
 
