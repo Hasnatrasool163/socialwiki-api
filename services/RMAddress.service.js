@@ -59,6 +59,7 @@ const buildAdjacentRegex = (phrase) => {
     return new RegExp(`\\b${parts.join('[,\\s]+')}\\b`, 'i');
 };
 
+
 const searchForExport = async ({ searchPostcode = '', searchDistrict = '', searchAddress = '', limit = 500 }) => {
     const query = {};
     const trimmedPostcode = (searchPostcode || '').trim();
@@ -66,8 +67,16 @@ const searchForExport = async ({ searchPostcode = '', searchDistrict = '', searc
     const trimmedAddress = (searchAddress || '').trim();
 
     if (trimmedPostcode) {
-        const postcodeQuery = buildPostcodePrefixQuery(trimmedPostcode);
-        if (postcodeQuery) query.postcode = postcodeQuery;
+        const clean = normalizeSearchPostcode(trimmedPostcode);
+        const noSpace = clean.replace(/\s/g, '');
+
+        const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
+        if (fullPostcodeRegex.test(clean)) {
+            query.postcode = clean;
+        } else {
+            const prefix = clean.toUpperCase();
+            query.postcode = { $gte: prefix, $lt: `${prefix}\uffff` };
+        }
     }
 
     if (trimmedDistrict) {
@@ -82,7 +91,7 @@ const searchForExport = async ({ searchPostcode = '', searchDistrict = '', searc
 
     const rows = await AddressMasterMerged.find(query)
         .select({ postcode: 1, district: 1, address: 1, dateCreated: 1, correctionVersion: 1, exceptionVersion: 1 })
-        .sort({ _id: 1 })
+        .sort({ postcode: 1, _id: 1 })
         .limit(limit)
         .lean();
 
@@ -148,9 +157,15 @@ const exportJobStarter = async ({ searchPostcode = '', searchDistrict = '', sear
     const trimmedDistrict = (searchDistrict || '').trim();
     const trimmedAddress = (searchAddress || '').trim();
 
-    if (trimmedPostcode) {
-        const postcodeQuery = buildPostcodePrefixQuery(trimmedPostcode);
-        if (postcodeQuery) query.postcode = postcodeQuery;
+  if (trimmedPostcode) {
+        const clean = normalizeSearchPostcode(trimmedPostcode);
+        const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
+        if (fullPostcodeRegex.test(clean)) {
+            query.postcode = clean;
+        } else {
+            const prefix = clean.toUpperCase();
+            query.postcode = { $gte: prefix, $lt: `${prefix}\uffff` };
+        }
     }
 
     if (trimmedDistrict) {
@@ -626,11 +641,11 @@ const getStats = async () => {
 };
 
 const buildPostcodePrefixQuery = (value) => {
-    const normalized = normalizeSearchPostcode(value);
-    if (!normalized) return null;
+    const clean = value.toString().trim().toUpperCase().replace(/\s+/g, '');
+    if (!clean) return null;
     return {
-        $gte: normalized,
-        $lt: `${normalized}\uffff`
+        $regex: `^${escapeRegex(clean)}`, 
+        $options: 'i'
     };
 };
 
