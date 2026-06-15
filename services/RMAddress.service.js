@@ -609,9 +609,12 @@ const getStats = async () => {
 };
 
 const buildPostcodePrefixQuery = (value) => {
-    const clean = value.toString().trim().toUpperCase().replace(/\s+/g, '');
-    if (!clean) return null;
-    return { $regex: `^${escapeRegex(clean)}`, $options: 'i' };
+    const normalized = normalizeSearchPostcode(value);
+    if (!normalized) return null;
+    return {
+        $gte: normalized,
+        $lt: `${normalized}\uffff`
+    };
 };
 
 const encodeCursorToken = (payload) => Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');

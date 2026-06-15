@@ -525,7 +525,6 @@ const getBlacklistFiles = async () => {
         await ensureImportDirectory();
         const files = await fs.promises.readdir(BLACKLIST_DIR);
         return files.filter(file => file.endsWith('.csv') || file.endsWith('.txt'));
-        return files.filter(file => file.endsWith('.csv') || file.endsWith('.txt'));
     } catch (error) {
         socialScrapeLogger.error('Error reading blacklist directory:', error);
         throw new Error('Failed to read blacklist directory');
