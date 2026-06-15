@@ -171,15 +171,18 @@ const importCsv = async (req, res) => {
             });
         }
 
+        // Reset tracker immediately so UI shows fresh state
+        RMAddressService.resetImportProgress();
+        RMAddressService.setImportRunning(true);
+
         (async () => {
             try {
-                await RMAddressService.importFromCsv({
-                    filePath: file.path
-                });
+                await RMAddressService.importFromCsv({ filePath: file.path });
             } catch (err) {
-                rmAddressLogger.error(
-                    `Import CSV failed for ${file.path}: ${err.message}`
-                );
+                rmAddressLogger.error(`Import CSV failed for ${file.path}: ${err.message}`);
+                RMAddressService.addImportError({ filename: file.filename, error: err.message });
+                RMAddressService.setImportRunning(false);
+                RMAddressService.setImportComplete(true);
             }
         })();
 
@@ -191,13 +194,9 @@ const importCsv = async (req, res) => {
 
     } catch (error) {
         rmAddressLogger.error(`Error in importCsv: ${error.message}`);
-        return res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        return res.status(500).json({ success: false, error: error.message });
     }
 };
-
 
 const editRecord = async (req, res) => {
     try {

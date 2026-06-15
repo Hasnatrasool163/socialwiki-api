@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const mongoose = require('mongoose');
 
-const AddressMasterMerged = require('../models/AddressMasterMergedTest');
+const AddressMasterMerged = require('../models/AddressMasterMerged');
 const PostcodeDistrict = require('../models/PostcodeDistrict');
 const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 
@@ -207,8 +207,18 @@ const importFromCsv = async ({ filePath }) => {
     const filename = path.basename(filePath);
     rmAddressLogger.info(`Starting import from CSV: ${filename}`);
 
+    // Wire into shared progress tracker so UI can see it
+    importProgressTracker.currentFile = filename;
+    importProgressTracker.processed = 0;
+    importProgressTracker.total = 0;
+    importProgressTracker.upserted = 0;
+    importProgressTracker.modified = 0;
+    importProgressTracker.skipped = 0;
+    importProgressTracker.isComplete = false;
+    importProgressTracker.isRunning = true;
+
     const parser = parse({
-        columns: true,          
+        columns: true,
         skip_empty_lines: true,
         trim: true,
         relax_column_count: true,
@@ -216,40 +226,47 @@ const importFromCsv = async ({ filePath }) => {
     });
 
     const stream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 }).pipe(parser);
-
     let batch = [];
-    let processed = 0;
-    let skipped = 0;
 
     for await (const record of stream) {
+        importProgressTracker.total += 1;
+
         const postcodeRaw = record.postcode || record.Postcode || '';
         const postcode = normalizePostcode(postcodeRaw);
         if (!postcode) {
-            skipped += 1;
+            importProgressTracker.skipped += 1;
             continue;
         }
-
 
         let district = (record.district || record.District || '').trim().toUpperCase();
+        if (!district) district = await resolveDistrict(postcode);
         if (!district) {
-            district = await resolveDistrict(postcode);
-        }
-        if (!district) {
-            skipped += 1;
+            importProgressTracker.skipped += 1;
             continue;
         }
-
 
         const addressRaw = (record.address || record.Address || '').trim();
         let addressParts = [];
 
-        if (addressRaw) {
-            addressParts = addressRaw.split(', ').map((s) => s.trim()).filter(Boolean);
+        if (record.address_json) {
+            try {
+                const parsed = JSON.parse(record.address_json);
+                if (Array.isArray(parsed)) addressParts = parsed;
+            } catch (e) {
+                addressParts = [String(record.address_json)];
+            }
+        }
+
+        if (!addressParts.length && addressRaw) {
+            // Split by ", " first (export format), fall back to ","
+            addressParts = addressRaw.includes(', ')
+                ? addressRaw.split(', ').map((s) => s.trim()).filter(Boolean)
+                : addressRaw.split(',').map((s) => s.trim()).filter(Boolean);
         }
 
         const standardized = standardizeAddressParts(addressParts, postcode, district);
         if (!standardized.length) {
-            skipped += 1;
+            importProgressTracker.skipped += 1;
             continue;
         }
 
@@ -265,7 +282,7 @@ const importFromCsv = async ({ filePath }) => {
             exceptionVersion: record.exceptionVersion || undefined
         });
 
-        processed += 1;
+        importProgressTracker.processed += 1;
 
         if (batch.length >= BATCH_SIZE) {
             await flushBatch(batch, filename);
@@ -275,8 +292,15 @@ const importFromCsv = async ({ filePath }) => {
 
     if (batch.length) await flushBatch(batch, filename);
 
-    rmAddressLogger.info(`Import from CSV complete: ${filename} processed=${processed}, skipped=${skipped}`);
-    return { processed, skipped };
+    importProgressTracker.isComplete = true;
+    importProgressTracker.isRunning = false;
+
+    rmAddressLogger.info(`importFromCsv complete: ${filename}, processed=${importProgressTracker.processed}, skipped=${importProgressTracker.skipped}`);
+
+    return {
+        processed: importProgressTracker.processed,
+        skipped: importProgressTracker.skipped
+    };
 };
 
 const updateRecord = async (id, data) => {
