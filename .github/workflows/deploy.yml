@@ -98,19 +98,9 @@ jobs:
           port: 22
           script: |
             cd /home/dev/api.socialwiki.co.uk/deploy
-            
-            # Create logs directory if it doesn't exist
             mkdir -p logs
             
-            # Use ecosystem.config.js for PM2 management
-            if pm2 list | grep -q "admin-backend"; then
-              echo "Reloading existing PM2 process..."
-              pm2 reload ecosystem.config.js --env production
-            else
-              echo "Starting new PM2 process..."
-              pm2 start ecosystem.config.js --env production
-            fi
-            
-            # Save PM2 configuration and setup startup script
+            pm2 delete socialwiki-api || true
+            pm2 start ecosystem.config.js --only socialwiki-api --env production
+
             pm2 save
-            pm2 startup | tail -n 1 | bash || true 
