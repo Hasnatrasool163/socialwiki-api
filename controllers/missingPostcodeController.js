@@ -9,8 +9,6 @@ const REPORT_DIR = path.join(__dirname, '../imports/reports/missing-postcodes');
 const REPORT_FILE_PREFIX = 'missing-postcodes';
 const REPORT_BATCH_SIZE = 5000;
 
-const activeReportJobs = new Map();
-
 const ensureReportDirectory = async () => {
     await fs.promises.mkdir(REPORT_DIR, { recursive: true });
 };
@@ -47,7 +45,31 @@ const writeLine = async (stream, line) => {
     await new Promise((resolve) => stream.once('drain', resolve));
 };
 
-const createReportJob = () => {
+const ReportJob = require('../models/ReportJob');
+
+const persistJob = async (job) => {
+    await ReportJob.findOneAndUpdate(
+        { jobId: job.jobId },
+        {
+            jobId: job.jobId,
+            status: job.status,
+            stage: job.stage,
+            progress: job.progress,
+            totalRows: job.totalRows,
+            processedRows: job.processedRows,
+            missingCount: job.missingCount,
+            fileName: job.fileName,
+            filePath: job.filePath,
+            downloadUrl: job.downloadUrl,
+            startedAt: job.startedAt,
+            completedAt: job.completedAt,
+            error: job.error
+        },
+        { upsert: true }
+    );
+};
+
+const createReportJob = async () => {
     const generatedAt = new Date();
     const jobId = `${generatedAt.getTime()}-${Math.random().toString(36).slice(2, 10)}`;
     const fileName = `${REPORT_FILE_PREFIX}-${generatedAt.toISOString().replace(/[:.]/g, '-')}.csv`;
@@ -68,11 +90,15 @@ const createReportJob = () => {
         error: null
     };
 
-    activeReportJobs.set(jobId, job);
+    await persistJob(job);
     return job;
 };
 
-const getReportJob = (jobId) => activeReportJobs.get(jobId?.toString());
+const getReportJob = async (jobId) => {
+    if (!jobId) return null;
+    const doc = await ReportJob.findOne({ jobId: jobId.toString() }).lean();
+    return doc;
+};
 
 const updateProgress = (job) => {
     if (!job.totalRows) {
@@ -99,6 +125,7 @@ const generateMissingPostcodesReport = async (job) => {
         job.error = null;
         job.completedAt = null;
         updateProgress(job);
+        await persistJob(job);
 
         outputStream = fs.createWriteStream(job.filePath, { encoding: 'utf8' });
         outputStream.write('postcode\n');
@@ -145,6 +172,7 @@ const generateMissingPostcodesReport = async (job) => {
             job.processedRows = processedRows;
             job.stage = 'writing';
             updateProgress(job);
+            await persistJob(job);
         };
 
         for await (const row of cursor) {
@@ -172,12 +200,14 @@ const generateMissingPostcodesReport = async (job) => {
         job.stage = 'completed';
         job.completedAt = new Date().toISOString();
         job.progress = 100;
+        await persistJob(job);
 
         postcodeLogger.info(`Missing postcode report generated: ${job.fileName} (${job.missingCount} rows)`);
     } catch (error) {
         job.status = 'failed';
         job.stage = 'failed';
         job.error = error.message;
+        await persistJob(job).catch(() => undefined);
 
         postcodeLogger.error(`Error generating missing postcode report: ${error.message}`);
 
@@ -191,7 +221,7 @@ const generateMissingPostcodesReport = async (job) => {
 
 const startMissingPostcodesReport = async (req, res) => {
     try {
-        const job = createReportJob();
+        const job = await createReportJob();
 
         generateMissingPostcodesReport(job).catch((error) => {
             postcodeLogger.error(`Background missing postcode report job ${job.jobId} failed: ${error.message}`);
@@ -216,7 +246,7 @@ const startMissingPostcodesReport = async (req, res) => {
 
 const getMissingPostcodesReportStatus = async (req, res) => {
     try {
-        const job = getReportJob(req.params.jobId);
+        const job = await getReportJob(req.params.jobId);
 
         if (!job) {
             return res.status(404).json({
@@ -242,7 +272,7 @@ const getMissingPostcodesReportStatus = async (req, res) => {
 const downloadMissingPostcodesReport = async (req, res) => {
     try {
         const jobId = req.params.jobId || req.query.jobId;
-        const job = getReportJob(jobId);
+        const job = await getReportJob(jobId);
 
         if (!job) {
             return res.status(404).json({
