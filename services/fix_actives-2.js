@@ -5,7 +5,7 @@ const readline = require('readline');
 const MONGO_URI = 'mongodb://localhost:27017/web_postalwiki';
 const IS_DRY_RUN = process.argv[2] !== 'apply';
 
-const CSV_FILE_PATH = 'NOT ACTIVE POST CODES-2.csv';
+const CSV_FILE_PATH = 'NOT ACTIVE POST CODES (2).csv';
 
 async function runSequence() {
     await mongoose.connect(MONGO_URI);

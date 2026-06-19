@@ -23,10 +23,10 @@ function cleanForDisplay(rawStr) {
 // Applies strict single-character filtering rules
 function processAddressField(rawStr) {
     if (!rawStr) return { updatedStr: rawStr, isChanged: false };
-    
+
     let elements = [];
     let isJson = false;
-    
+
     try {
         if (rawStr.trim().startsWith('[')) {
             const parsed = JSON.parse(rawStr);
@@ -36,29 +36,30 @@ function processAddressField(rawStr) {
             }
         }
     } catch (e) {}
-    
-    if (!isJson) {
-        elements = [rawStr];
-    }
-    
+
+    if (!isJson) elements = [rawStr];
+
     let changed = false;
     const updatedElements = elements.map(el => {
         let fixed = el;
-        
-        // 1. Rule: Compress 2 or more sequential single alpha letters safely (A A Name -> AA Name)
-        // Lookahead ensures we preserve single spaces before full words (J R Smith -> JR Smith)
-        fixed = fixed.replace(/\b([A-Za-z])(?:\s+([A-Za-z]))+(?=\s|,|$)/g, m => m.replace(/\s+/g, ''));
-        
-        // 2. Exception 2: Fix Ampersands "A & A" -> "A&A" (STRICTLY single letters only)
-        fixed = fixed.replace(/\b([A-Za-z])\s*&\s*([A-Za-z])\b/g, '$1&$2');
-        
-        // 3. Exception 2: Fix Dashes "A – A" -> "A-A" (STRICTLY single letters only using literal en-dash)
-        fixed = fixed.replace(/\b([A-Za-z])\s*[–-]\s*([A-Za-z])\b/g, '$1-$2');
-        
+
+        // 1. Compress sequences of isolated single letters (e.g., "A A Name" -> "AA Name")
+        // The `+` ensures it ONLY triggers if there are at least TWO single letters in a row.
+        // This safely ignores "Ty'r Y Sarn", "Life's A", and "Ty'n Y" because they only have one isolated letter.
+        fixed = fixed.replace(/(^|\s|,\s*)((?:[A-Za-z]\s+)+[A-Za-z])(?=\s|$|,)/g, (match, prefix, chars) => {
+            return prefix + chars.replace(/\s+/g, '');
+        });
+
+        // 2. Fix Ampersands, Pluses, and Dashes (A & A -> A&A, AB - AB -> AB-AB)
+        // EXCEPTION: {1,2} strictly limits this to 1 or 2 characters. 
+        // This prevents "Rob & Smith", "Plumbing & Heating", and "XXX & XXX" from being compressed.
+        // It also ignores "P's & Q's" because the apostrophe breaks the A-Z match.
+        fixed = fixed.replace(/(^|\s|,\s*)([A-Za-z]{1,2})\s*([&+\-–])\s*([A-Za-z]{1,2}(?:'s)?)(?=\s|$|,)/g, '$1$2$3$4');
+
         if (fixed !== el) changed = true;
         return fixed;
     });
-    
+
     const updatedStr = isJson ? JSON.stringify(updatedElements) : updatedElements[0];
     return { updatedStr, isChanged: changed };
 }

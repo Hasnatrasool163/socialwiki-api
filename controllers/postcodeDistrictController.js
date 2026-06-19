@@ -198,53 +198,34 @@ async function processCsvFile(filePath, job) {
 
 async function insertBatch(batch, job) {
     try {
-        const result = await PostcodeDistrict.insertMany(batch, { ordered: false });
-        job.insertedCount += result.length;
-    } catch (error) {
-        // Detailed logging for debugging production issues
-        postcodeLogger.debug(`Batch insertion exception. Code: ${error.code}, Name: ${error.name}.`);
-
-        if (error.code === 11000 || error.name === 'BulkWriteError' || error.name === 'MongoBulkWriteError') {
-            // Handle duplicates / partial success
-
-            // 1. Calculate inserted count safely
-            // Mongoose creates error.insertedDocs for unordered mode
-            const insertedDocsCount = error.insertedDocs ? error.insertedDocs.length : 0;
-            // Native driver might provide result.nInserted
-            const resultInserted = (error.result && typeof error.result.nInserted === 'number') ? error.result.nInserted : 0;
-
-            // Use whichever is available, default to 0
-            // Logic: If result.nInserted is available, it's usually reliable. If not, insertedDocs length.
-            const nInserted = Math.max(insertedDocsCount, resultInserted);
-
-            job.insertedCount += nInserted;
-
-            if (isNaN(job.insertedCount)) {
-                postcodeLogger.error(`Critical: Job insertedCount became NaN. Batch size: ${batch.length}, nInserted derived: ${nInserted}`);
-                job.insertedCount = 0;
+        const operations = batch.map(item => ({
+            updateOne: {
+                filter: { postcode: item.postcode },
+                update: { $set: { district: item.district } },
+                upsert: true // Creates the row if it doesn't exist, updates it if it does
             }
+        }));
 
-            // 2. Handle Errors
-            if (error.writeErrors) {
-                job.errorCount += error.writeErrors.length;
+        const result = await PostcodeDistrict.bulkWrite(operations, { ordered: false });
 
-                // Log sample for user
-                if (error.writeErrors.length > 0 && job.errorLogs.length < 50) {
-                    const firstErr = error.writeErrors[0];
-                    const opCode = firstErr.err && firstErr.err.op ? firstErr.err.op.postcode : 'Batch Error';
-                    job.errorLogs.push(`Duplicate/Error: ${opCode}`);
-                }
+        job.insertedCount += batch.length;
 
-                // Detailed server log
-                if (error.writeErrors.length > 0) {
-                    postcodeLogger.info(`Batch had ${error.writeErrors.length} duplicates. Successfully inserted: ${nInserted}`);
-                }
-            } else {
-                job.errorCount += (batch.length - nInserted);
-                postcodeLogger.warn(`Batch error 11000 but no writeErrors found. Full error: ${JSON.stringify(error)}`);
+    } catch (error) {
+        postcodeLogger.debug(`Batch bulkWrite exception. Code: ${error.code}, Name: ${error.name}.`);
+
+        if (error.writeErrors) {
+            const failedCount = error.writeErrors.length;
+            const successCount = batch.length - failedCount;
+
+            job.insertedCount += successCount;
+            job.errorCount += failedCount;
+
+            if (failedCount > 0 && job.errorLogs.length < 50) {
+                const firstErr = error.writeErrors[0];
+                const msg = firstErr.errmsg || 'BulkWrite Update Error';
+                job.errorLogs.push(`Error: ${msg}`);
             }
         } else {
-            // General unexpected error
             job.errorCount += batch.length;
             job.errorLogs.push(error.message || 'Unknown batch error');
             postcodeLogger.error(`Batch insert critical failure job ${job._id}: ${error.message}`, { stack: error.stack });

@@ -3,6 +3,7 @@ module.exports = {
     name: 'socialwiki-api',
     script: './server.js',
     instances: 1, // or 'max' for cluster mode
+    exec_mode: 'fork',
     autorestart: true,
     watch: false,
     max_memory_restart: '2G',
