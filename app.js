@@ -15,6 +15,7 @@ const postcodeDistrictRoutes = require('./routes/postcodeDistrictRoutes');
 const reportRoutes = require('./routes/reportRoutes');
 const rmAddressRoutes = require('./routes/rmAddressRoutes');
 const propPriceRoutes = require('./routes/propPriceRoutes');
+const rmAddressEditRoutes = require('./routes/rmAddressEditRoutes');
 const app = express();
 
 // Body parser - Move this before security middleware
@@ -92,6 +93,7 @@ app.use('/api/reports', verifyToken, authorizeRoles('admin'), reportRoutes);
 app.use('/api/prop-price', verifyToken, authorizeRoles('admin'), propPriceRoutes);
 
 app.use('/api/rm-address', rmAddressRoutes);
+app.use('/api/rm-address/edit', verifyToken, authorizeRoles('admin'), rmAddressEditRoutes);
 
 // ✅ admin-only route example
 app.get('/admin', verifyToken, authorizeRoles('admin'), (req, res) => {
