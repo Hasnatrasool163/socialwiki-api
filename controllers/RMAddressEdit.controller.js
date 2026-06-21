@@ -4,8 +4,8 @@ const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 
 const previewSearch = async (req, res) => {
     try {
-        const { searchPostcode, searchDistrict, searchAddress } = req.body || {};
-        const result = await RMAddressEditService.previewEditSearch({ searchPostcode, searchDistrict, searchAddress });
+        const { searchPostcode, searchDistrict, searchAddress, searchDate } = req.body || {};
+        const result = await RMAddressEditService.previewEditSearch({ searchPostcode, searchDistrict, searchAddress, searchDate });
         return res.status(200).json({ success: true, ...result });
     } catch (error) {
         rmAddressLogger.error(`Edit preview failed: ${error.message}`);
@@ -15,8 +15,8 @@ const previewSearch = async (req, res) => {
 
 const confirmExport = async (req, res) => {
     try {
-        const { searchPostcode, searchDistrict, searchAddress } = req.body || {};
-        const { jobId } = await RMAddressEditService.startEditExportJob({ searchPostcode, searchDistrict, searchAddress });
+        const { searchPostcode, searchDistrict, searchAddress, searchDate } = req.body || {};
+        const { jobId } = await RMAddressEditService.startEditExportJob({ searchPostcode, searchDistrict, searchAddress, searchDate });
         return res.status(200).json({ success: true, jobId });
     } catch (error) {
         rmAddressLogger.error(`Edit export confirm failed: ${error.message}`);
