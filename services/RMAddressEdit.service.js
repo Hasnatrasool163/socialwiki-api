@@ -55,6 +55,10 @@ const buildEditSearchQuery = ({ searchPostcode = '', searchDistrict = '', search
     const addr = (searchAddress || '').trim();
     const date = (searchDate || '').trim();
 
+    if (addr) {
+        const regex = buildAdjacentPhraseRegex(addr);
+        if (regex) query.address = { $regex: regex };
+    }
     if (pc) {
         const normalized = normalizePostcode(pc);
         query.postcode = { $gte: normalized, $lt: `${normalized}\uffff` };
@@ -63,28 +67,24 @@ const buildEditSearchQuery = ({ searchPostcode = '', searchDistrict = '', search
         const normalizedDist = dist.toUpperCase();
         query.district = { $gte: normalizedDist, $lt: `${normalizedDist}\uffff` };
     }
-    if (addr) {
-        const regex = buildAdjacentPhraseRegex(addr);
-        if (regex) query.address = { $regex: regex };
-    }
     if (date) {
         query.dateCreated = date;
     }
     return query;
 };
 
-const validateEditFilters = ({ searchPostcode, searchDate }) => {
-    const hasPostcode = !!(searchPostcode || '').trim();
+const validateEditFilters = ({ searchAddress, searchDate }) => {
+    const hasAddress = !!(searchAddress || '').trim();
     const hasDate = !!(searchDate || '').trim();
 
-    if (!hasPostcode && !hasDate) {
-        throw new Error('Postcode is required, unless searching by date alone.');
+    if (!hasAddress && !hasDate) {
+        throw new Error('Address is required, unless searching by date alone.');
     }
 };
 
 // STEP 1 — preview only. Nothing is touched in the DB.
 const previewEditSearch = async ({ searchPostcode, searchDistrict, searchAddress, searchDate }) => {
-    validateEditFilters({ searchPostcode, searchDate });
+    validateEditFilters({ searchAddress, searchDate });
     const query = buildEditSearchQuery({ searchPostcode, searchDistrict, searchAddress, searchDate });
 
     const sortStage = (searchPostcode || '').trim() ? { postcode: 1, _id: 1 } : { _id: 1 };
@@ -115,7 +115,7 @@ const previewEditSearch = async ({ searchPostcode, searchDistrict, searchAddress
 // STEP 2 — user clicked Continue. Export ALL matches (not capped to 500) to CSV,
 // backing up + deleting in batches as we go.
 const startEditExportJob = async ({ searchPostcode, searchDistrict, searchAddress, searchDate }) => {
-    validateEditFilters({ searchPostcode, searchDate });
+    validateEditFilters({ searchAddress, searchDate });
     const query = buildEditSearchQuery({ searchPostcode, searchDistrict, searchAddress, searchDate });
 
     await ensureDir(EDIT_EXPORT_DIR);
