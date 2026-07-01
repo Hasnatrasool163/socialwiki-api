@@ -80,19 +80,19 @@ const buildEditSearchQuery = ({ searchPostcode = '', searchDistrict = '', search
     return query;
 };
 
-const validateEditFilters = ({ searchPostcode, searchDate, postcodes }) => {
-    const hasPostcode = !!(searchPostcode || '').trim();
+const validateEditFilters = ({ searchAddress, searchDate, postcodes }) => {
+    const hasAddress = !!(searchAddress || '').trim();
     const hasDate = !!(searchDate || '').trim();
     const hasPostcodeList = Array.isArray(postcodes) && postcodes.length > 0;
 
-    if (!hasPostcode && !hasDate && !hasPostcodeList) {
-        throw new Error('Provide a postcode, a date, or upload a list of postcodes.');
+    if (!hasAddress && !hasDate && !hasPostcodeList) {
+        throw new Error('Provide an address, a date, or upload a list of postcodes.');
     }
 };
 
 // STEP 1 — preview only. Nothing is touched in the DB.
 const previewEditSearch = async ({ searchPostcode, searchDistrict, searchAddress, searchDate, postcodes = [] }) => {
-    validateEditFilters({ searchPostcode, searchDate, postcodes });
+    validateEditFilters({ searchAddress, searchDate, postcodes });
     const query = buildEditSearchQuery({ searchPostcode, searchDistrict, searchAddress, searchDate, postcodes });
 
     const sortStage = (searchPostcode || '').trim() || postcodes.length > 0 ? { postcode: 1, _id: 1 } : { _id: 1 };
@@ -123,7 +123,7 @@ const previewEditSearch = async ({ searchPostcode, searchDistrict, searchAddress
 // STEP 2 — user clicked Continue. Export ALL matches to CSV,
 // backing up + deleting in batches.
 const startEditExportJob = async ({ searchPostcode, searchDistrict, searchAddress, searchDate, postcodes = [] }) => {
-    validateEditFilters({ searchPostcode, searchDate, postcodes });
+    validateEditFilters({ searchAddress, searchDate, postcodes });
     const query = buildEditSearchQuery({ searchPostcode, searchDistrict, searchAddress, searchDate, postcodes });
 
     await ensureDir(EDIT_EXPORT_DIR);
