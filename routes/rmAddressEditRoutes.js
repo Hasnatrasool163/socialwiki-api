@@ -32,6 +32,15 @@ const upload = multer({
     limits: { fileSize: 200 * 1024 * 1024 }
 });
 
+const memoryUpload = multer({
+    storage: multer.memoryStorage(),
+    fileFilter: (req, file, cb) => {
+        const name = (file.originalname || '').toLowerCase();
+        if (name.endsWith('.csv') || name.endsWith('.txt')) return cb(null, true);
+        cb(new Error('Only .csv or .txt files are allowed.'));
+    },
+    limits: { fileSize: 10 * 1024 * 1024 } 
+});
 
 router.post('/preview', RMAddressEditController.previewSearch);
 router.post('/export', RMAddressEditController.confirmExport);
@@ -49,6 +58,17 @@ router.post(
         });
     },
     RMAddressEditController.reimportCsv
+);
+
+router.post(
+    '/parse-postcodes',
+    (req, res, next) => {
+        memoryUpload.single('file')(req, res, (error) => {
+            if (error) return res.status(400).json({ success: false, message: error.message });
+            return next();
+        });
+    },
+    RMAddressEditController.parsePostcodeFile
 );
 
 module.exports = router;

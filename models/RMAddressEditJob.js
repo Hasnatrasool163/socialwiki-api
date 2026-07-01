@@ -20,6 +20,7 @@ const RMAddressEditJobSchema = new mongoose.Schema({
     searchDistrict: { type: String, default: '' },
     searchAddress: { type: String, default: '' },
     searchDate: { type: String, default: '' },  
+    bulkPostcodeCount: { type: Number, default: 0 },
     exportedCount: { type: Number, default: 0 },
     deletedCount: { type: Number, default: 0 },
     reimportedCount: { type: Number, default: 0 },

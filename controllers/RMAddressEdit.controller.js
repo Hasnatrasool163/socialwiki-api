@@ -4,8 +4,11 @@ const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 
 const previewSearch = async (req, res) => {
     try {
-        const { searchPostcode, searchDistrict, searchAddress, searchDate } = req.body || {};
-        const result = await RMAddressEditService.previewEditSearch({ searchPostcode, searchDistrict, searchAddress, searchDate });
+        const { searchPostcode, searchDistrict, searchAddress, searchDate, postcodes } = req.body || {};
+        const result = await RMAddressEditService.previewEditSearch({
+            searchPostcode, searchDistrict, searchAddress, searchDate,
+            postcodes: Array.isArray(postcodes) ? postcodes : []
+        });
         return res.status(200).json({ success: true, ...result });
     } catch (error) {
         rmAddressLogger.error(`Edit preview failed: ${error.message}`);
@@ -15,12 +18,31 @@ const previewSearch = async (req, res) => {
 
 const confirmExport = async (req, res) => {
     try {
-        const { searchPostcode, searchDistrict, searchAddress, searchDate } = req.body || {};
-        const { jobId } = await RMAddressEditService.startEditExportJob({ searchPostcode, searchDistrict, searchAddress, searchDate });
+        const { searchPostcode, searchDistrict, searchAddress, searchDate, postcodes } = req.body || {};
+        const { jobId } = await RMAddressEditService.startEditExportJob({
+            searchPostcode, searchDistrict, searchAddress, searchDate,
+            postcodes: Array.isArray(postcodes) ? postcodes : []
+        });
         return res.status(200).json({ success: true, jobId });
     } catch (error) {
         rmAddressLogger.error(`Edit export confirm failed: ${error.message}`);
         return res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+const parsePostcodeFile = async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, message: 'No file uploaded' });
+        }
+
+        const content = req.file.buffer.toString('utf8');
+        const result = RMAddressEditService.parsePostcodeListContent(content);
+
+        return res.status(200).json({ success: true, ...result });
+    } catch (error) {
+        rmAddressLogger.error(`Parse postcode file failed: ${error.message}`);
+        return res.status(500).json({ success: false, message: error.message });
     }
 };
 
@@ -70,6 +92,7 @@ module.exports = {
         confirmExport,
         getJobStatus,
         downloadExportCsv,
-        reimportCsv
+        reimportCsv,
+        parsePostcodeFile
     }
 };

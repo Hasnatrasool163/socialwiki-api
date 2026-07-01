@@ -48,20 +48,27 @@ const addressTextFromDoc = (doc) => {
     return doc.address || '';
 };
 
-const buildEditSearchQuery = ({ searchPostcode = '', searchDistrict = '', searchAddress = '', searchDate = '' }) => {
+const buildEditSearchQuery = ({ searchPostcode = '', searchDistrict = '', searchAddress = '', searchDate = '', postcodes = [] }) => {
     const query = {};
-    const pc = (searchPostcode || '').trim();
+
+    if (Array.isArray(postcodes) && postcodes.length > 0) {
+        query.postcode = { $in: postcodes };
+    } else {
+        const pc = (searchPostcode || '').trim();
+        if (pc) {
+            const normalized = normalizePostcode(pc);
+            query.postcode = { $gte: normalized, $lt: `${normalized}\uffff` };
+        }
+    }
+
     const dist = (searchDistrict || '').trim();
     const addr = (searchAddress || '').trim();
     const date = (searchDate || '').trim();
 
+
     if (addr) {
         const regex = buildAdjacentPhraseRegex(addr);
         if (regex) query.address = { $regex: regex };
-    }
-    if (pc) {
-        const normalized = normalizePostcode(pc);
-        query.postcode = { $gte: normalized, $lt: `${normalized}\uffff` };
     }
     if (dist) {
         const normalizedDist = dist.toUpperCase();
@@ -73,21 +80,22 @@ const buildEditSearchQuery = ({ searchPostcode = '', searchDistrict = '', search
     return query;
 };
 
-const validateEditFilters = ({ searchAddress, searchDate }) => {
-    const hasAddress = !!(searchAddress || '').trim();
+const validateEditFilters = ({ searchPostcode, searchDate, postcodes }) => {
+    const hasPostcode = !!(searchPostcode || '').trim();
     const hasDate = !!(searchDate || '').trim();
+    const hasPostcodeList = Array.isArray(postcodes) && postcodes.length > 0;
 
-    if (!hasAddress && !hasDate) {
-        throw new Error('Address is required, unless searching by date alone.');
+    if (!hasPostcode && !hasDate && !hasPostcodeList) {
+        throw new Error('Provide a postcode, a date, or upload a list of postcodes.');
     }
 };
 
 // STEP 1 — preview only. Nothing is touched in the DB.
-const previewEditSearch = async ({ searchPostcode, searchDistrict, searchAddress, searchDate }) => {
-    validateEditFilters({ searchAddress, searchDate });
-    const query = buildEditSearchQuery({ searchPostcode, searchDistrict, searchAddress, searchDate });
+const previewEditSearch = async ({ searchPostcode, searchDistrict, searchAddress, searchDate, postcodes = [] }) => {
+    validateEditFilters({ searchPostcode, searchDate, postcodes });
+    const query = buildEditSearchQuery({ searchPostcode, searchDistrict, searchAddress, searchDate, postcodes });
 
-    const sortStage = (searchPostcode || '').trim() ? { postcode: 1, _id: 1 } : { _id: 1 };
+    const sortStage = (searchPostcode || '').trim() || postcodes.length > 0 ? { postcode: 1, _id: 1 } : { _id: 1 };
 
     const [rows, totalMatching] = await Promise.all([
         AddressMasterMerged.find(query)
@@ -112,11 +120,11 @@ const previewEditSearch = async ({ searchPostcode, searchDistrict, searchAddress
     };
 };
 
-// STEP 2 — user clicked Continue. Export ALL matches (not capped to 500) to CSV,
-// backing up + deleting in batches as we go.
-const startEditExportJob = async ({ searchPostcode, searchDistrict, searchAddress, searchDate }) => {
-    validateEditFilters({ searchAddress, searchDate });
-    const query = buildEditSearchQuery({ searchPostcode, searchDistrict, searchAddress, searchDate });
+// STEP 2 — user clicked Continue. Export ALL matches to CSV,
+// backing up + deleting in batches.
+const startEditExportJob = async ({ searchPostcode, searchDistrict, searchAddress, searchDate, postcodes = [] }) => {
+    validateEditFilters({ searchPostcode, searchDate, postcodes });
+    const query = buildEditSearchQuery({ searchPostcode, searchDistrict, searchAddress, searchDate, postcodes });
 
     await ensureDir(EDIT_EXPORT_DIR);
 
@@ -126,7 +134,8 @@ const startEditExportJob = async ({ searchPostcode, searchDistrict, searchAddres
         searchPostcode: searchPostcode || '',
         searchDistrict: searchDistrict || '',
         searchAddress: searchAddress || '',
-        searchDate: searchDate || ''
+        searchDate: searchDate || '',
+        bulkPostcodeCount: postcodes.length  
     });
 
     runEditExportJob(job._id, query).catch(async (error) => {
@@ -330,13 +339,39 @@ const processReimport = async (filePath, reimportJobId, exportJobId) => {
     await fs.promises.unlink(filePath).catch(() => undefined);
 };
 
+const parsePostcodeListContent = (content) => {
+    const lines = content.split(/[\r\n,;]+/);
+    const valid = [];
+    const skipped = [];
+
+    for (const line of lines) {
+        const raw = line.trim();
+        if (!raw) continue;
+        const normalized = normalizePostcode(raw);
+        if (normalized) {
+            valid.push(normalized);
+        } else {
+            skipped.push(raw.slice(0, 20)); 
+        }
+    }
+
+    const unique = [...new Set(valid)];
+    return {
+        postcodes: unique,
+        validCount: unique.length,
+        duplicatesRemoved: valid.length - unique.length,
+        invalidCount: skipped.length
+    };
+};
+
 module.exports = {
     RMAddressEditService: {
         previewEditSearch,
         startEditExportJob,
         getEditJobStatus,
         downloadEditExportFile,
-        reimportEditedCsv
+        reimportEditedCsv,
+        parsePostcodeListContent
     },
     EDIT_EXPORT_DIR,
     EDIT_IMPORT_DIR
