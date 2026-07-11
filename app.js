@@ -16,6 +16,8 @@ const reportRoutes = require('./routes/reportRoutes');
 const rmAddressRoutes = require('./routes/rmAddressRoutes');
 const propPriceRoutes = require('./routes/propPriceRoutes');
 const rmAddressEditRoutes = require('./routes/rmAddressEditRoutes');
+const rmAddressAiRoutes = require('./routes/rmAddressAiRoutes');
+
 const app = express();
 
 // Body parser - Move this before security middleware
@@ -99,6 +101,8 @@ app.use('/api/rm-address/edit', verifyToken, authorizeRoles('admin'), rmAddressE
 app.get('/admin', verifyToken, authorizeRoles('admin'), (req, res) => {
     res.json({ message: 'Welcome admin!' });
 });
+
+app.use('/api/rm-address/ai', rmAddressAiRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
