@@ -29,7 +29,7 @@ const upload = multer({
         if (isCsvName || isCsvMime) return cb(null, true);
         cb(new Error('Only CSV files are allowed.'));
     },
-    limits: { fileSize: 200 * 1024 * 1024 }
+    limits: { fileSize: 550 * 1024 * 1024 }
 });
 
 const memoryUpload = multer({

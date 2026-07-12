@@ -261,18 +261,47 @@ const reimportEditedCsv = async ({ filePath, exportJobId }) => {
 };
 
 const processReimport = async (filePath, reimportJobId, exportJobId) => {
+    const fileStats = await fs.promises.stat(filePath).catch(() => null);
+    if (!fileStats || fileStats.size === 0) {
+        throw new Error('Uploaded file is empty or unreadable — check upload succeeded');
+    }
+
+    rmAddressLogger.info(`Reimport job ${reimportJobId}: file=${filePath}, size=${fileStats.size} bytes`);
+
     const parser = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 }).pipe(parse({
         columns: true,
         skip_empty_lines: true,
         trim: true,
         relax_column_count: true,
-        relax_quotes: true
+        relax_quotes: true,
+        bom: true,          
+        encoding: 'utf8'
     }));
 
     let reimportedCount = 0;
     let skippedCount = 0;
     let batch = [];
+    let rowIndex = 0;
+    let firstRecordLogged = false;
+
+    const skipReasons = {
+        noPostcode: 0,
+        noAddress: 0,
+        noDistrict: 0
+    };
+
     const dateCreated = getDateCreated();
+
+    const districtCache = new Map();
+
+    const resolveDistrictCached = async (postcode) => {
+        if (districtCache.has(postcode)) {
+            return districtCache.get(postcode);
+        }
+        const district = await resolveDistrictForPostcode(postcode);
+        districtCache.set(postcode, district);   
+        return district;
+    };
 
     const flush = async () => {
         if (!batch.length) return;
@@ -287,39 +316,93 @@ const processReimport = async (filePath, reimportJobId, exportJobId) => {
         batch = [];
     };
 
-    for await (const record of parser) {
-        const rawPostcode = (record.postcode || record.Postcode || '').trim();
-        const rawAddress = (record.address || record.Address || '').trim();
-        const rawDistrict = (record.district || record.District || '').trim();
+    try {
+        for await (const record of parser) {
+            rowIndex += 1;
 
-        const postcode = normalizePostcode(rawPostcode);
-        if (!postcode || !rawAddress) {
-            skippedCount += 1;
-            continue;
+            if (!firstRecordLogged) {
+                firstRecordLogged = true;
+                rmAddressLogger.info(
+                    `Reimport ${reimportJobId}: first record keys = [${Object.keys(record).join(', ')}] | ` +
+                    `values = [${Object.values(record).slice(0, 4).join(' | ')}]`
+                );
+            }
+
+            const rawPostcode = (record.postcode || record.Postcode || '').trim();
+            const rawAddress  = (record.address  || record.Address  || '').trim();
+            const rawDistrict = (record.district || record.District || '').trim();
+
+            const postcode = normalizePostcode(rawPostcode);
+
+            if (!postcode) {
+                skippedCount += 1;
+                skipReasons.noPostcode += 1;
+                continue;
+            }
+
+            if (!rawAddress) {
+                skippedCount += 1;
+                skipReasons.noAddress += 1;
+                continue;
+            }
+
+            const district = rawDistrict
+                ? rawDistrict.toUpperCase()
+                : await resolveDistrictCached(postcode);   
+
+            if (!district) {
+                skippedCount += 1;
+                skipReasons.noDistrict += 1;
+                continue;
+            }
+
+            const addressParts = rawAddress
+                .split(',')
+                .map((p) => p.trim())
+                .filter(Boolean);
+
+            batch.push({
+                postcode,
+                district,
+                address: JSON.stringify(addressParts),
+                dateCreated,
+                correctionVersion: 'v1-reimport'
+            });
+
+            reimportedCount += 1;
+
+            if (batch.length >= REIMPORT_BATCH_SIZE) {
+                await flush();
+            }
+
+            if (rowIndex % 25000 === 0) {
+                rmAddressLogger.info(
+                    `Reimport ${reimportJobId}: row ${rowIndex.toLocaleString()} — ` +
+                    `imported ${reimportedCount.toLocaleString()}, skipped ${skippedCount.toLocaleString()}`
+                );
+                await RMAddressEditJob.findByIdAndUpdate(reimportJobId, {
+                    reimportedCount,
+                    reimportSkippedCount: skippedCount
+                });
+            }
         }
 
-        const district = rawDistrict ? rawDistrict.toUpperCase() : await resolveDistrictForPostcode(postcode);
-        if (!district) {
-            skippedCount += 1;
-            continue;
+        await flush();
+
+        if (skippedCount > 0) {
+            rmAddressLogger.warn(
+                `Reimport ${reimportJobId}: ${skippedCount} rows skipped — ` +
+                `noPostcode=${skipReasons.noPostcode}, noAddress=${skipReasons.noAddress}, noDistrict=${skipReasons.noDistrict}`
+            );
         }
 
-        const addressParts = rawAddress.split(',').map((p) => p.trim()).filter(Boolean);
+        districtCache.clear();
 
-        batch.push({
-            postcode,
-            district,
-            address: JSON.stringify(addressParts),
-            dateCreated,                 // import date used, as agreed — original date isn't kept
-            correctionVersion: 'v1-reimport'
-        });
-
-        reimportedCount += 1;
-        if (batch.length >= REIMPORT_BATCH_SIZE) await flush();
+    } catch (error) {
+        districtCache.clear();
+        throw error;
     }
-    await flush();
 
-    // Mark the backup snapshots as reimported (audit trail link). Never deletes the backup itself.
     if (exportJobId) {
         await RMAddressDeletedBackup.updateMany(
             { exportJobId },
@@ -334,7 +417,12 @@ const processReimport = async (filePath, reimportJobId, exportJobId) => {
         completedAt: new Date()
     });
 
-    rmAddressLogger.info(`Reimport job ${reimportJobId} completed: reimported=${reimportedCount}, skipped=${skippedCount}`);
+    rmAddressLogger.info(
+        `Reimport ${reimportJobId} completed: reimported=${reimportedCount}, ` +
+        `skipped=${skippedCount} (noPostcode=${skipReasons.noPostcode}, ` +
+        `noAddress=${skipReasons.noAddress}, noDistrict=${skipReasons.noDistrict}), ` +
+        `districtCacheSize=${districtCache.size}`
+    );
 
     await fs.promises.unlink(filePath).catch(() => undefined);
 };
