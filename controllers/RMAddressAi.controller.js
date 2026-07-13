@@ -545,18 +545,6 @@ const groupByPostcode = (records) => {
     }, {});
 };
 
-const stopJob = async (req, res) => {
-    try {
-        await RMAddressAiJob.findByIdAndUpdate(req.params.jobId, {
-            stopRequested: true
-        });
-        rmAddressLogger.info(`Stop requested for AI job ${req.params.jobId}`);
-        return res.json({ success: true, message: 'Stop requested — current batch will complete, no new batches will load' });
-    } catch (error) {
-        return res.status(500).json({ success: false, message: error.message });
-    }
-};
-
 const applyManualEdit = async (req, res) => {
     try {
         const { manualAddress } = req.body || {};
