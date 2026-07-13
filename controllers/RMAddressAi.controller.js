@@ -4,17 +4,28 @@ const RMAddressAiCorrection = require('../models/RMAddressAiCorrection');
 const RMAddressManualReview = require('../models/RMAddressManualReview');
 const AddressMasterMerged = require('../models/AddressMasterMerged');
 const rmAddressLogger = require('../config/loggers/rmAddressLogger');
+const AddressMasterPending = require('../models/AddressMasterPending');
+const { parse } = require('csv-parse');
+const fs = require('fs');
 
 const BATCH_TARGET = 300;
 
 
 const createJob = async (req, res) => {
     try {
-        const { jobName } = req.body || {};
+        const { jobName, sourceCollection } = req.body || {};
+
+        const validCollections = ['address_master_merged', 'address_master_pending'];
+        const resolvedSource = validCollections.includes(sourceCollection)
+            ? sourceCollection
+            : 'address_master_merged';
+
         const job = await RMAddressAiJob.create({
-            jobName: jobName || `ai_run_${Date.now()}`
+            jobName: jobName || `ai_run_${Date.now()}`,
+            sourceCollection: resolvedSource
         });
-        rmAddressLogger.info(`AI job created: ${job._id} — ${job.jobName}`);
+
+        rmAddressLogger.info(`AI job created: ${job._id} — ${job.jobName} — source: ${resolvedSource}`);
         return res.json({ success: true, jobId: job._id, job });
     } catch (error) {
         rmAddressLogger.error(`Create AI job failed: ${error.message}`);
@@ -95,15 +106,28 @@ const getNextBatch = async (req, res) => {
         if (job.status === 'paused') {
             return res.json({ success: true, paused: true, message: 'Job is paused' });
         }
-        if (job.status === 'completed') {
-            return res.json({ success: true, complete: true, message: 'All records processed' });
+        if (job.status === 'completed' || job.status === 'stopped') {
+            return res.json({ success: true, complete: true, message: 'Job finished' });
         }
+
+        if (job.stopRequested) {
+            await RMAddressAiJob.findByIdAndUpdate(job._id, {
+                status: 'stopped',
+                stopRequested: false
+            });
+            rmAddressLogger.info(`AI job ${job._id} stopped cleanly after batch completion`);
+            return res.json({ success: true, stopped: true, message: 'Job stopped cleanly' });
+        }
+
+        const Model = job.sourceCollection === 'address_master_pending'
+            ? require('../models/AddressMasterPending')
+            : AddressMasterMerged;
 
         const baseQuery = job.lastProcessedId
             ? { _id: { $gt: new mongoose.Types.ObjectId(job.lastProcessedId) } }
             : {};
 
-        const initialBatch = await AddressMasterMerged.find(baseQuery)
+        const initialBatch = await Model.find(baseQuery)
             .sort({ _id: 1 })
             .limit(BATCH_TARGET)
             .select({ postcode: 1, district: 1, address: 1, dateCreated: 1 })
@@ -117,7 +141,7 @@ const getNextBatch = async (req, res) => {
         const lastRecord = initialBatch[initialBatch.length - 1];
         const lastPostcode = lastRecord.postcode;
 
-        const remainderOfBlock = await AddressMasterMerged.find({
+        const remainderOfBlock = await Model.find({
             _id: { $gt: lastRecord._id },
             postcode: lastPostcode
         })
@@ -141,6 +165,7 @@ const getNextBatch = async (req, res) => {
         return res.json({
             success: true,
             complete: false,
+            sourceCollection: job.sourceCollection,
             batchNumber: job.totalBatchesComplete + 1,
             recordCount: fullBatch.length,
             initialCount: initialBatch.length,
@@ -520,6 +545,262 @@ const groupByPostcode = (records) => {
     }, {});
 };
 
+const stopJob = async (req, res) => {
+    try {
+        await RMAddressAiJob.findByIdAndUpdate(req.params.jobId, {
+            stopRequested: true
+        });
+        rmAddressLogger.info(`Stop requested for AI job ${req.params.jobId}`);
+        return res.json({ success: true, message: 'Stop requested — current batch will complete, no new batches will load' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const applyManualEdit = async (req, res) => {
+    try {
+        const { manualAddress } = req.body || {};
+        if (!manualAddress || !manualAddress.trim()) {
+            return res.status(400).json({ success: false, message: 'manualAddress is required' });
+        }
+
+        const correction = await RMAddressAiCorrection.findById(req.params.id);
+        if (!correction) return res.status(404).json({ success: false, message: 'Not found' });
+        if (correction.status !== 'pending') {
+            return res.status(400).json({ success: false, message: `Already ${correction.status}` });
+        }
+
+        // Apply the human-edited version — not the AI suggestion
+        await AddressMasterMerged.findByIdAndUpdate(
+            correction.originalId,
+            {
+                $set: {
+                    address: JSON.stringify(
+                        manualAddress.trim().split(',').map((p) => p.trim()).filter(Boolean)
+                    ),
+                    correctionVersion: 'v1-manually-edited'
+                }
+            }
+        );
+
+        await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, {
+            status: 'manually_edited',
+            manualAddress: manualAddress.trim()
+        });
+
+        rmAddressLogger.info(`Correction ${req.params.id} manually edited and applied`);
+        return res.json({ success: true });
+    } catch (error) {
+        rmAddressLogger.error(`applyManualEdit failed: ${error.message}`);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const deleteOriginalAddress = async (req, res) => {
+    try {
+        const correction = await RMAddressAiCorrection.findById(req.params.id);
+        if (!correction) return res.status(404).json({ success: false, message: 'Not found' });
+        if (correction.status !== 'pending') {
+            return res.status(400).json({ success: false, message: `Already ${correction.status}` });
+        }
+
+        await AddressMasterMerged.findByIdAndDelete(correction.originalId);
+
+        await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, { status: 'deleted' });
+
+        rmAddressLogger.info(`Address ${correction.originalId} deleted via correction ${req.params.id}`);
+        return res.json({ success: true });
+    } catch (error) {
+        rmAddressLogger.error(`deleteOriginalAddress failed: ${error.message}`);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// ── Stop Job ──────────────────────────────────────────────────────────────────
+
+const stopJob = async (req, res) => {
+    try {
+        await RMAddressAiJob.findByIdAndUpdate(req.params.jobId, {
+            stopRequested: true
+        });
+        rmAddressLogger.info(`Stop requested for AI job ${req.params.jobId}`);
+        return res.json({ success: true, message: 'Stop requested — current batch will complete, no new batches will load' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// ── Upload to Pending ─────────────────────────────────────────────────────────
+
+const uploadToPending = async (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+    res.status(202).json({ success: true, message: 'Import started', file: req.file.filename });
+    processPendingFile(req.file.path).catch((err) => {
+        rmAddressLogger.error(`Pending import failed: ${err.message}`);
+    });
+};
+
+const processPendingFile = async (filePath) => {
+    rmAddressLogger.info(`Pending import starting: ${filePath}`);
+
+    const districtCache = new Map();
+
+    const resolveDistrict = async (postcode) => {
+        if (districtCache.has(postcode)) return districtCache.get(postcode);
+        const PostcodeDistrict = require('../models/PostcodeDistrict');
+        const exact = await PostcodeDistrict.findOne({ postcode }).lean();
+        if (exact?.district) {
+            districtCache.set(postcode, exact.district.toUpperCase().trim());
+            return districtCache.get(postcode);
+        }
+        const outward = postcode.split(' ')[0] || '';
+        const prefix  = await PostcodeDistrict.findOne({
+            postcode: { $regex: `^${outward.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s`, $options: 'i' }
+        }).lean();
+        const district = prefix?.district ? prefix.district.toUpperCase().trim() : null;
+        districtCache.set(postcode, district);
+        return district;
+    };
+
+    const normalizePostcode = (v) => {
+        if (!v) return '';
+        const compact = v.toString().trim().toUpperCase().replace(/\s+/g, ' ').replace(/[^A-Z0-9 ]/g, '');
+        if (!compact) return '';
+        const noSpace = compact.replace(/\s+/g, '');
+        if (noSpace.length > 3) return `${noSpace.slice(0, noSpace.length - 3)} ${noSpace.slice(noSpace.length - 3)}`;
+        return compact;
+    };
+
+    const getDate = () => {
+        const now = new Date();
+        return `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
+    };
+
+    const parser = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 }).pipe(parse({
+        columns: false,
+        skip_empty_lines: true,
+        trim: true,
+        relax_column_count: true,
+        relax_quotes: true,
+        bom: true
+    }));
+
+    let batch = [];
+    let imported = 0;
+    let skipped  = 0;
+    const BATCH_SIZE  = 2000;
+    const dateCreated = getDate();
+
+    const flush = async () => {
+        if (!batch.length) return;
+        const ops = batch.map((doc) => ({
+            updateOne: {
+                filter: { postcode: doc.postcode, address: doc.address },
+                update: { $set: doc },
+                upsert: true
+            }
+        }));
+        await AddressMasterPending.bulkWrite(ops, { ordered: false });
+        batch = [];
+    };
+
+    for await (const record of parser) {
+        if (!Array.isArray(record) || record.length < 2) { skipped++; continue; }
+        const postcode = normalizePostcode(record[0]);
+        if (!postcode) { skipped++; continue; }
+        const rawParts = record.slice(1).map((p) => (p || '').trim()).filter(Boolean);
+        if (!rawParts.length) { skipped++; continue; }
+        const district = await resolveDistrict(postcode);
+        if (!district) { skipped++; continue; }
+
+        batch.push({
+            postcode,
+            district,
+            address: JSON.stringify(rawParts),
+            dateCreated,
+            correctionVersion: 'v1-pending'
+        });
+
+        imported++;
+        if (batch.length >= BATCH_SIZE) await flush();
+        if (imported % 25000 === 0) {
+            rmAddressLogger.info(`Pending import: ${imported.toLocaleString()} imported, ${skipped} skipped`);
+        }
+    }
+
+    await flush();
+    districtCache.clear();
+
+    rmAddressLogger.info(`Pending import complete: ${imported.toLocaleString()} imported, ${skipped} skipped`);
+    await fs.promises.unlink(filePath).catch(() => undefined);
+};
+
+const getPendingStats = async (req, res) => {
+    try {
+        const count = await AddressMasterPending.estimatedDocumentCount();
+        return res.json({ success: true, count });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+const fixBracketCapitalization = async (req, res) => {
+    try {
+        const { dryRun = true } = req.body || {};
+
+        const candidates = await AddressMasterMerged.find({
+            address: { $regex: '\\([a-z]' }
+        })
+            .select({ _id: 1, address: 1 })
+            .lean();
+
+        rmAddressLogger.info(`fixBracketCapitalization: found ${candidates.length} candidates, dryRun=${dryRun}`);
+
+        if (dryRun) {
+            const samples = candidates.slice(0, 20).map((c) => {
+                const original = formatAddressForAi(c.address);
+                const fixed    = original.replace(/\(([a-z])/g, (_, ch) => `(${ch.toUpperCase()}`);
+                return { id: c._id, original, fixed };
+            });
+            return res.json({ success: true, dryRun: true, totalFound: candidates.length, samples });
+        }
+
+        const BATCH = 1000;
+        let fixed = 0;
+
+        for (let i = 0; i < candidates.length; i += BATCH) {
+            const chunk = candidates.slice(i, i + BATCH);
+            const ops   = [];
+
+            for (const doc of chunk) {
+                const addressText = formatAddressForAi(doc.address);
+                const corrected   = addressText.replace(/\(([a-z])/g, (_, ch) => `(${ch.toUpperCase()}`);
+                if (corrected === addressText) continue;
+                const parts = corrected.split(',').map((p) => p.trim()).filter(Boolean);
+                ops.push({
+                    updateOne: {
+                        filter: { _id: doc._id },
+                        update: { $set: { address: JSON.stringify(parts), correctionVersion: 'v1-bracket-cap-fix' } }
+                    }
+                });
+            }
+
+            if (ops.length) {
+                await AddressMasterMerged.bulkWrite(ops, { ordered: false });
+                fixed += ops.length;
+            }
+        }
+
+        rmAddressLogger.info(`fixBracketCapitalization complete: ${fixed} updated`);
+        return res.json({ success: true, dryRun: false, totalFound: candidates.length, fixed });
+
+    } catch (error) {
+        rmAddressLogger.error(`fixBracketCapitalization failed: ${error.message}`);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 module.exports = {
     RMAddressAiController: {
         createJob,
@@ -528,6 +809,9 @@ module.exports = {
         pauseJob,
         resumeJob,
         resetJob,
+        stopJob, 
+        applyManualEdit,
+        deleteOriginalAddress,
         getNextBatch,
         submitBatchResults,
         getCorrections,
@@ -536,6 +820,9 @@ module.exports = {
         bulkApproveCorrections,
         bulkRejectCorrections,
         getManualReviewItems,
-        resolveManualReview
+        resolveManualReview,
+        uploadToPending,           
+        getPendingStats,           
+        fixBracketCapitalization   
     }
 };

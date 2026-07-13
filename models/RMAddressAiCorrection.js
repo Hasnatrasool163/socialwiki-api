@@ -14,7 +14,7 @@ const RMAddressAiCorrectionSchema = new mongoose.Schema({
     },
     status: {
         type: String,
-        enum: ['pending', 'approved', 'rejected'],
+        enum: ['pending', 'approved', 'rejected', 'manually_edited', 'deleted'],
         default: 'pending',
         index: true
     },
