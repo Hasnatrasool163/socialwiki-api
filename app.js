@@ -94,15 +94,13 @@ app.use('/api/postcode-district', verifyToken, authorizeRoles('admin'), postcode
 app.use('/api/reports', verifyToken, authorizeRoles('admin'), reportRoutes);
 app.use('/api/prop-price', verifyToken, authorizeRoles('admin'), propPriceRoutes);
 
-app.use('/api/rm-address', rmAddressRoutes);
 app.use('/api/rm-address/edit', verifyToken, authorizeRoles('admin'), rmAddressEditRoutes);
+app.use('/api/rm-address/ai', rmAddressAiRoutes);
+app.use('/api/rm-address', rmAddressRoutes); 
 
-// ✅ admin-only route example
 app.get('/admin', verifyToken, authorizeRoles('admin'), (req, res) => {
     res.json({ message: 'Welcome admin!' });
 });
-
-app.use('/api/rm-address/ai', rmAddressAiRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
