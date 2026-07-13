@@ -201,30 +201,54 @@ const submitBatchResults = async (req, res) => {
             return res.status(400).json({ success: false, message: 'lastIdInBatch is required' });
         }
 
+        // ── Determine which collection this job reads from ──
+        const job = await RMAddressAiJob.findById(jobId).lean();
+        if (!job) {
+            return res.status(404).json({ success: false, message: 'Job not found' });
+        }
+
+        // Use the correct model based on sourceCollection
+        const SourceModel = job.sourceCollection === 'address_master_pending'
+            ? require('../models/AddressMasterPending')
+            : AddressMasterMerged;
+
         const session = await mongoose.startSession();
         session.startTransaction();
 
         try {
-
+            // Corrections — staged, no DB change yet (Option B)
             if (corrections.length > 0) {
-                const correctionDocs = corrections.map((c) => ({
-                    jobId,
-                    originalId: new mongoose.Types.ObjectId(c.originalId),
-                    postcode: c.postcode,
-                    originalAddress: c.originalAddress,
-                    correctedAddress: c.correctedAddress,
-                    correctionType: c.correctionType,
-                    confidence: c.confidence || 'high',
-                    status: 'pending',   
-                    batchNumber
+                const correctionOps = corrections.map((c) => ({
+                    updateOne: {
+                        filter: {
+                            jobId: jobId,
+                            originalId: new mongoose.Types.ObjectId(c.originalId)
+                        },
+                        update: {
+                            $setOnInsert: {
+                                jobId,
+                                originalId: new mongoose.Types.ObjectId(c.originalId),
+                                postcode: c.postcode,
+                                originalAddress: c.originalAddress,
+                                correctedAddress: c.correctedAddress,
+                                correctionType: c.correctionType,
+                                confidence: c.confidence || 'high',
+                                status: 'pending',
+                                batchNumber
+                            }
+                        },
+                        upsert: true
+                    }
                 }));
-                await RMAddressAiCorrection.insertMany(correctionDocs, { session });
+                await RMAddressAiCorrection.bulkWrite(correctionOps, { session });
             }
 
+            // Manual review — backup from correct collection, then delete
             if (manualReview.length > 0) {
                 const originalIds = manualReview.map((r) => new mongoose.Types.ObjectId(r.originalId));
 
-                const originalDocs = await AddressMasterMerged.find(
+                // ── KEY FIX: look up from the right collection ──
+                const originalDocs = await SourceModel.find(
                     { _id: { $in: originalIds } }
                 ).lean();
 
@@ -238,9 +262,10 @@ const submitBatchResults = async (req, res) => {
                     return {
                         jobId,
                         originalId: new mongoose.Types.ObjectId(r.originalId),
+                        sourceCollection: job.sourceCollection,  // record where it came from
                         postcode: original.postcode,
                         district: original.district,
-                        address: original.address,          
+                        address: original.address,
                         dateCreated: original.dateCreated,
                         correctionVersion: original.correctionVersion,
                         exceptionVersion: original.exceptionVersion,
@@ -255,7 +280,8 @@ const submitBatchResults = async (req, res) => {
 
                 await RMAddressManualReview.insertMany(reviewDocs, { session });
 
-                await AddressMasterMerged.deleteMany(
+                // ── KEY FIX: delete from the right collection ──
+                await SourceModel.deleteMany(
                     { _id: { $in: originalIds } },
                     { session }
                 );
@@ -289,11 +315,15 @@ const submitBatchResults = async (req, res) => {
             session.endSession();
         }
 
-        rmAddressLogger.info(`Batch ${batchNumber} saved for job ${jobId}: ${corrections.length} staged, ${manualReview.length} manual, ${cleanCount} clean`);
+        rmAddressLogger.info(
+            `Batch ${batchNumber} saved for job ${jobId} ` +
+            `(source: ${job.sourceCollection}): ` +
+            `${corrections.length} staged, ${manualReview.length} manual, ${cleanCount} clean`
+        );
 
         return res.json({
             success: true,
-            message: `Batch ${batchNumber} saved — ${corrections.length} staged for approval, ${manualReview.length} manual review, ${cleanCount} clean`
+            message: `Batch ${batchNumber} saved — ${corrections.length} staged, ${manualReview.length} manual review, ${cleanCount} clean`
         });
     } catch (error) {
         rmAddressLogger.error(`submitBatchResults failed: ${error.message}`);
@@ -483,43 +513,39 @@ const resolveManualReview = async (req, res) => {
             return res.status(400).json({ success: false, message: `Already resolved: ${item.status}` });
         }
 
+        // ── Restore to the collection it came from ──
+        const TargetModel = item.sourceCollection === 'address_master_pending'
+            ? require('../models/AddressMasterPending')
+            : AddressMasterMerged;
+
         if (action === 'restore_original') {
-            await AddressMasterMerged.create({
+            await TargetModel.create({
                 _id: new mongoose.Types.ObjectId(String(item.originalId)),
                 postcode: item.postcode,
                 district: item.district,
-                address: item.address,         
+                address: item.address,
                 dateCreated: item.dateCreated,
                 correctionVersion: item.correctionVersion,
                 exceptionVersion: item.exceptionVersion
             });
             await RMAddressManualReview.findByIdAndUpdate(req.params.id, { status: 'restored' });
-            rmAddressLogger.info(`Manual review ${req.params.id} restored to main collection`);
 
         } else if (action === 'apply_suggestion') {
             const addressToApply = correctedAddress || item.aiSuggestedAddress;
             if (!addressToApply) {
                 return res.status(400).json({ success: false, message: 'No corrected address provided' });
             }
-
-            await AddressMasterMerged.create({
+            await TargetModel.create({
                 postcode: item.postcode,
                 district: item.district,
-                address: JSON.stringify(
-                    addressToApply.split(',').map((p) => p.trim()).filter(Boolean)
-                ),
+                address: JSON.stringify(addressToApply.split(',').map(p => p.trim()).filter(Boolean)),
                 dateCreated: item.dateCreated,
                 correctionVersion: 'v1-ai-corrected'
             });
             await RMAddressManualReview.findByIdAndUpdate(req.params.id, { status: 'applied' });
-            rmAddressLogger.info(`Manual review ${req.params.id} applied with correction`);
 
         } else if (action === 'delete_permanently') {
-            await RMAddressManualReview.findByIdAndUpdate(req.params.id, {
-                status: 'deleted_permanently'
-            });
-            rmAddressLogger.info(`Manual review ${req.params.id} permanently deleted`);
-
+            await RMAddressManualReview.findByIdAndUpdate(req.params.id, { status: 'deleted_permanently' });
         } else {
             return res.status(400).json({ success: false, message: `Unknown action: ${action}` });
         }
@@ -793,6 +819,36 @@ const fixBracketCapitalization = async (req, res) => {
     }
 };
 
+const deleteJob = async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.jobId)) {
+            return res.status(404).json({ success: false, message: 'Invalid job ID' });
+        }
+
+        const job = await RMAddressAiJob.findById(req.params.jobId);
+        if (!job) return res.status(404).json({ success: false, message: 'Job not found' });
+
+        if (job.status === 'running') {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot delete a running job. Stop or pause it first.'
+            });
+        }
+
+        await Promise.all([
+            RMAddressAiJob.findByIdAndDelete(req.params.jobId),
+            RMAddressAiCorrection.deleteMany({ jobId: req.params.jobId }),
+            RMAddressManualReview.deleteMany({ jobId: req.params.jobId })
+        ]);
+
+        rmAddressLogger.info(`AI job ${req.params.jobId} deleted`);
+        return res.json({ success: true, message: 'Job deleted' });
+    } catch (error) {
+        rmAddressLogger.error(`deleteJob failed: ${error.message}`);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 module.exports = {
     RMAddressAiController: {
         createJob,
@@ -802,6 +858,7 @@ module.exports = {
         resumeJob,
         resetJob,
         stopJob, 
+        deleteJob,
         applyManualEdit,
         deleteOriginalAddress,
         getNextBatch,

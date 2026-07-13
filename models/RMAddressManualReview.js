@@ -18,6 +18,11 @@ const RMAddressManualReviewSchema = new mongoose.Schema({
         default: 'pending',
         index: true
     },
+    sourceCollection: {
+    type: String,
+        enum: ['address_master_merged', 'address_master_pending'],
+        default: 'address_master_merged'
+    },
     removedFromMain: { type: Boolean, default: false },
     batchNumber: { type: Number }
 }, {

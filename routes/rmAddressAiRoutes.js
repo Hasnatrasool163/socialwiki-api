@@ -61,6 +61,7 @@ router.get('/manual-review', RMAddressAiController.getManualReviewItems);
 router.post('/manual-review/:id/resolve', RMAddressAiController.resolveManualReview);
 
 router.post('/job/:jobId/stop', RMAddressAiController.stopJob);
+router.delete('/job/:jobId', RMAddressAiController.deleteJob);
 
 router.post('/corrections/:id/manual-edit', RMAddressAiController.applyManualEdit);
 router.post('/corrections/:id/delete-address', RMAddressAiController.deleteOriginalAddress);
