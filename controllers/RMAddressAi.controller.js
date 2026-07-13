@@ -47,6 +47,10 @@ const listJobs = async (req, res) => {
 
 const getJobStatus = async (req, res) => {
     try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.jobId)) {
+            return res.status(404).json({ success: false, message: 'Invalid job ID format' });
+        }
+
         const job = await RMAddressAiJob.findById(req.params.jobId).lean();
         if (!job) return res.status(404).json({ success: false, message: 'Job not found' });
 
