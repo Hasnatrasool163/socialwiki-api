@@ -7,6 +7,8 @@ const { authorizeRoles } = require('../middlewares/rolemiddleware');
 router.use(verifyToken, authorizeRoles('admin'));
 
 router.get('/stats',                            RMAddressPrecheckController.getStats);
+router.put('/record/:id', RMAddressPrecheckController.editRecord);
+router.delete('/record/:id', RMAddressPrecheckController.deleteRecord);
 router.get('/next-block',                       RMAddressPrecheckController.getNextBlock);
 router.post('/block/:postcode/approve',         RMAddressPrecheckController.approveBlock);
 router.post('/block/:postcode/move-to-ai',      RMAddressPrecheckController.moveBlockToAi);

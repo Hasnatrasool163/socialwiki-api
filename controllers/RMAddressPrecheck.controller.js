@@ -266,12 +266,108 @@ const swapColumns = async (req, res) => {
     }
 };
 
+const editRecord = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { parts } = req.body || {};
+
+        if (!Array.isArray(parts) || parts.filter(p => typeof p === 'string' && p.trim()).length === 0) {
+            return res.status(400).json({ success: false, message: 'parts must be a non-empty array of strings' });
+        }
+
+        const cleanParts = parts.map(p => String(p).trim()).filter(Boolean);
+
+        const record = await AddressMasterPrecheck.findById(id);
+        if (!record) {
+            return res.status(404).json({ success: false, message: 'Record not found' });
+        }
+
+        record.address = JSON.stringify(cleanParts);
+        record.correctionVersion = 'v1-precheck-edited';
+        await record.save();
+
+        rmAddressLogger.info(`Precheck edit: ${id} (${record.postcode}) address updated`);
+
+        // Reload same block so the UI shows the edit without a second round trip
+        const updated = await AddressMasterPrecheck.find({ postcode: record.postcode })
+            .sort({ _id: 1 })
+            .lean();
+
+        const formatted = updated.map(r => ({
+            _id:      String(r._id),
+            postcode: r.postcode,
+            district: r.district,
+            parts:    addressPartsFromDoc(r.address),
+            address:  r.address
+        }));
+
+        const maxParts = Math.max(...formatted.map(r => r.parts.length), 0);
+
+        return res.json({
+            success:     true,
+            postcode:    record.postcode,
+            district:    updated[0]?.district || '',
+            recordCount: updated.length,
+            maxParts,
+            records:     formatted
+        });
+    } catch (error) {
+        rmAddressLogger.error(`editRecord failed: ${error.message}`);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+const deleteRecord = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const record = await AddressMasterPrecheck.findById(id).lean();
+        if (!record) {
+            return res.status(404).json({ success: false, message: 'Record not found' });
+        }
+
+        await AddressMasterPrecheck.deleteOne({ _id: id });
+
+        rmAddressLogger.info(`Precheck delete: ${id} (${record.postcode}) removed`);
+
+        // Reload same block — may now have one fewer record, or be empty
+        const updated = await AddressMasterPrecheck.find({ postcode: record.postcode })
+            .sort({ _id: 1 })
+            .lean();
+
+        const formatted = updated.map(r => ({
+            _id:      String(r._id),
+            postcode: r.postcode,
+            district: r.district,
+            parts:    addressPartsFromDoc(r.address),
+            address:  r.address
+        }));
+
+        const maxParts = Math.max(...formatted.map(r => r.parts.length), 0);
+
+        return res.json({
+            success:     true,
+            deleted:     true,
+            postcode:    record.postcode,
+            district:    updated[0]?.district || record.district || '',
+            recordCount: updated.length,
+            maxParts,
+            records:     formatted
+        });
+    } catch (error) {
+        rmAddressLogger.error(`deleteRecord failed: ${error.message}`);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 module.exports = {
     RMAddressPrecheckController: {
         getStats,
         getNextBlock,
         approveBlock,
         moveBlockToAi,
-        swapColumns
+        swapColumns,
+        editRecord,
+        deleteRecord
     }
 };
