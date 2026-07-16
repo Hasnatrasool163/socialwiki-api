@@ -289,7 +289,7 @@ const submitBatchResults = async (req, res) => {
             batchNumber,
             corrections = [],
             manualReview = [],
-            clean = []
+            cleanCount = 0 
         } = req.body || {};
 
         if (!lastIdInBatch) {
@@ -311,35 +311,35 @@ const submitBatchResults = async (req, res) => {
         // auto-promoted. District is deliberately NOT taken from the AI
         // client for either — it's resolved from PostcodeDistrict at
         // approval time instead.
-        const stagedRecords = [
-            ...corrections.map((c) => ({ ...c, correctionType: c.correctionType || 'other' })),
-            ...clean.map((c) => ({
-                originalId: c.originalId,
-                postcode: c.postcode,
-                originalAddress: c.originalAddress,
-                correctedAddress: c.originalAddress,
-                correctionType: 'clean',
-                confidence: 'high'
-            }))
-        ];
+        // const stagedRecords = [
+        //     ...corrections.map((c) => ({ ...c, correctionType: c.correctionType || 'other' })),
+        //     ...clean.map((c) => ({
+        //         originalId: c.originalId,
+        //         postcode: c.postcode,
+        //         originalAddress: c.originalAddress,
+        //         correctedAddress: c.originalAddress,
+        //         correctionType: 'clean',
+        //         confidence: 'high'
+        //     }))
+        // ];
 
-        if (stagedRecords.length > 0) {
-            const correctionOps = stagedRecords.map((c) => ({
+        if (corrections.length > 0) {
+            const correctionOps = corrections.map((c) => ({
                 updateOne: {
                     filter: {
-                        jobId: jobId,
+                        jobId:      jobId,
                         originalId: new mongoose.Types.ObjectId(c.originalId)
                     },
                     update: {
                         $setOnInsert: {
                             jobId,
-                            originalId: new mongoose.Types.ObjectId(c.originalId),
-                            postcode: c.postcode,
-                            originalAddress: c.originalAddress,
+                            originalId:       new mongoose.Types.ObjectId(c.originalId),
+                            postcode:         c.postcode,
+                            originalAddress:  c.originalAddress,
                             correctedAddress: c.correctedAddress,
-                            correctionType: c.correctionType,
-                            confidence: c.confidence || 'high',
-                            status: 'pending',
+                            correctionType:   c.correctionType,
+                            confidence:       c.confidence || 'high',
+                            status:           'pending',
                             batchNumber
                         }
                     },
@@ -408,7 +408,7 @@ const submitBatchResults = async (req, res) => {
                 totalBatchesComplete: 1,
                 totalCorrections: corrections.length,
                 totalManualReview: manualReview.length,
-                totalClean: clean.length
+                totalClean: cleanCount
             }
         });
 
