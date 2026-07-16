@@ -3,22 +3,116 @@ const RMAddressAiJob = require('../models/RMAddressAiJob');
 const RMAddressAiCorrection = require('../models/RMAddressAiCorrection');
 const RMAddressManualReview = require('../models/RMAddressManualReview');
 const AddressMasterMerged = require('../models/AddressMasterMerged');
-const rmAddressLogger = require('../config/loggers/rmAddressLogger');
+const AddressMasterChecked = require('../models/AddressMasterChecked');
 const AddressMasterPending = require('../models/AddressMasterPending');
+const PostcodeDistrict = require('../models/PostcodeDistrict');
+const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 const { parse } = require('csv-parse');
 const fs = require('fs');
 
 const BATCH_TARGET = 300;
+
+const districtCache = new Map();
+
+const resolveDistrict = async (postcode) => {
+    if (districtCache.has(postcode)) return districtCache.get(postcode);
+
+    const exact = await PostcodeDistrict.findOne({ postcode }).lean();
+    if (exact?.district) {
+        const d = exact.district.toUpperCase().trim();
+        districtCache.set(postcode, d);
+        return d;
+    }
+
+    const outward = postcode.split(' ')[0] || '';
+    const prefix = await PostcodeDistrict.findOne({
+        postcode: { $regex: `^${outward.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s`, $options: 'i' }
+    }).lean();
+
+    const district = prefix?.district ? prefix.district.toUpperCase().trim() : null;
+    districtCache.set(postcode, district);
+    return district;
+};
+
+const normalizePostcode = (v) => {
+    if (!v) return '';
+    const compact = v.toString().trim().toUpperCase().replace(/\s+/g, ' ').replace(/[^A-Z0-9 ]/g, '');
+    if (!compact) return '';
+    const noSpace = compact.replace(/\s+/g, '');
+    if (noSpace.length > 3) {
+        return `${noSpace.slice(0, noSpace.length - 3)} ${noSpace.slice(noSpace.length - 3)}`;
+    }
+    return compact;
+};
+
+const getDateCreated = () => {
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, '0');
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    return `${dd}/${mm}/${now.getFullYear()}`;
+};
+
+const getSourceModel = (sourceCollection) => {
+    switch (sourceCollection) {
+        case 'address_master_precheck': return require('../models/AddressMasterPrecheck');
+        case 'address_master_ai_queue': return require('../models/AddressMasterAiQueue');
+        case 'address_master_pending':  return require('../models/AddressMasterPending');
+        case 'address_master_checked':  return AddressMasterChecked;
+        default:                        return AddressMasterMerged;
+    }
+};
+
+const formatAddressForAi = (address) => {
+    if (typeof address === 'string' && address.startsWith('[')) {
+        try {
+            const parsed = JSON.parse(address);
+            if (Array.isArray(parsed)) return parsed.join(', ');
+        } catch (e) {}
+    }
+    return address || '';
+};
+
+const groupByPostcode = (records) => {
+    return records.reduce((acc, r) => {
+        if (!acc[r.postcode]) acc[r.postcode] = [];
+        acc[r.postcode].push(r);
+        return acc;
+    }, {});
+};
+
+// Upsert a corrected/clean address into address_master_checked (the new AI
+// master). District is always resolved server-side from PostcodeDistrict —
+// the Ollama/LM Studio client never supplies it.
+const upsertChecked = async (postcode, addressParts, dateCreated) => {
+    const district = await resolveDistrict(postcode);
+    if (!district) return { ok: false, reason: `No district found for postcode ${postcode}` };
+
+    await AddressMasterChecked.updateOne(
+        { postcode, address: JSON.stringify(addressParts) },
+        {
+            $set: {
+                postcode,
+                district,
+                address: JSON.stringify(addressParts),
+                correctionVersion: 'v1-ai-corrected'
+            },
+            $setOnInsert: { dateCreated }
+        },
+        { upsert: true }
+    );
+    return { ok: true };
+};
 
 
 const createJob = async (req, res) => {
     try {
         const { jobName, sourceCollection } = req.body || {};
 
-        const validCollections = ['address_master_merged', 'address_master_pending'];
+        const validCollections = ['address_master_merged', 'address_master_pending', 'address_master_precheck', 'address_master_ai_queue'];
+
         const resolvedSource = validCollections.includes(sourceCollection)
             ? sourceCollection
-            : 'address_master_merged';
+            : 'address_master_ai_queue';
 
         const job = await RMAddressAiJob.create({
             jobName: jobName || `ai_run_${Date.now()}`,
@@ -123,9 +217,7 @@ const getNextBatch = async (req, res) => {
             return res.json({ success: true, stopped: true, message: 'Job stopped cleanly' });
         }
 
-        const Model = job.sourceCollection === 'address_master_pending'
-            ? require('../models/AddressMasterPending')
-            : AddressMasterMerged;
+        const Model = getSourceModel(job.sourceCollection);
 
         const baseQuery = job.lastProcessedId
             ? { _id: { $gt: new mongoose.Types.ObjectId(job.lastProcessedId) } }
@@ -156,12 +248,15 @@ const getNextBatch = async (req, res) => {
         const fullBatch = [...initialBatch, ...remainderOfBlock];
         const finalLastId = fullBatch[fullBatch.length - 1]._id;
 
+        // Format for the AI client as "<24-char id>|<address text>" so its
+        // response schema ("id" copied verbatim before "|") lines up exactly
+        // with what's sent.
         const formattedRecords = fullBatch.map((r) => ({
             id: String(r._id),
             postcode: r.postcode,
             district: r.district,
             address: formatAddressForAi(r.address),
-            formatted: `${r.postcode},${formatAddressForAi(r.address)}`
+            formatted: `${String(r._id)}|${formatAddressForAi(r.address)}`
         }));
 
         const grouped = groupByPostcode(formattedRecords);
@@ -194,7 +289,7 @@ const submitBatchResults = async (req, res) => {
             batchNumber,
             corrections = [],
             manualReview = [],
-            cleanCount = 0
+            clean = []
         } = req.body || {};
 
         if (!lastIdInBatch) {
@@ -206,13 +301,30 @@ const submitBatchResults = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Job not found' });
         }
 
-        const SourceModel = job.sourceCollection === 'address_master_pending'
-            ? require('../models/AddressMasterPending')
-            : AddressMasterMerged;
+        const SourceModel = getSourceModel(job.sourceCollection);
 
-        // ── Corrections — staged, no DB change yet (Option B) ──
-        if (corrections.length > 0) {
-            const correctionOps = corrections.map((c) => ({
+        // ── Corrections + clean — both staged for admin approval, no DB
+        // change to the source yet (Option B). "Clean" records are staged
+        // exactly like corrections but with correctedAddress === originalAddress
+        // and correctionType 'clean', so they flow through the same
+        // approve/reject/bulk-approve pipeline instead of being silently
+        // auto-promoted. District is deliberately NOT taken from the AI
+        // client for either — it's resolved from PostcodeDistrict at
+        // approval time instead.
+        const stagedRecords = [
+            ...corrections.map((c) => ({ ...c, correctionType: c.correctionType || 'other' })),
+            ...clean.map((c) => ({
+                originalId: c.originalId,
+                postcode: c.postcode,
+                originalAddress: c.originalAddress,
+                correctedAddress: c.originalAddress,
+                correctionType: 'clean',
+                confidence: 'high'
+            }))
+        ];
+
+        if (stagedRecords.length > 0) {
+            const correctionOps = stagedRecords.map((c) => ({
                 updateOne: {
                     filter: {
                         jobId: jobId,
@@ -257,7 +369,7 @@ const submitBatchResults = async (req, res) => {
                 return {
                     jobId,
                     originalId: new mongoose.Types.ObjectId(r.originalId),
-                    sourceCollection: job.sourceCollection || 'address_master_merged',
+                    sourceCollection: job.sourceCollection || 'address_master_ai_queue',
                     postcode: original.postcode,
                     district: original.district,
                     address: original.address,
@@ -292,23 +404,23 @@ const submitBatchResults = async (req, res) => {
                 lastPostcode: lastPostcode || ''
             },
             $inc: {
-                totalFetched: corrections.length + manualReview.length + cleanCount,
+                totalFetched: corrections.length + manualReview.length + clean.length,
                 totalBatchesComplete: 1,
                 totalCorrections: corrections.length,
                 totalManualReview: manualReview.length,
-                totalClean: cleanCount
+                totalClean: clean.length
             }
         });
 
         rmAddressLogger.info(
             `Batch ${batchNumber} saved for job ${jobId} ` +
             `(source: ${job.sourceCollection}): ` +
-            `${corrections.length} staged, ${manualReview.length} manual, ${cleanCount} clean`
+            `${corrections.length} corrections staged, ${manualReview.length} manual, ${clean.length} clean staged for approval`
         );
 
         return res.json({
             success: true,
-            message: `Batch ${batchNumber} saved — ${corrections.length} staged, ${manualReview.length} manual review, ${cleanCount} clean`
+            message: `Batch ${batchNumber} saved — ${corrections.length} corrections + ${clean.length} clean staged for approval, ${manualReview.length} manual review`
         });
 
     } catch (error) {
@@ -367,21 +479,20 @@ const approveCorrection = async (req, res) => {
             return res.status(400).json({ success: false, message: `Already ${correction.status}` });
         }
 
-        await AddressMasterMerged.findByIdAndUpdate(
-            correction.originalId,
-            {
-                $set: {
-                    address: JSON.stringify(
-                        correction.correctedAddress.split(',').map((p) => p.trim()).filter(Boolean)
-                    ),
-                    correctionVersion: 'v1-ai-corrected'
-                }
-            }
-        );
+        const job = await RMAddressAiJob.findById(correction.jobId).lean();
+        if (!job) return res.status(404).json({ success: false, message: 'Parent job not found' });
+        const SourceModel = getSourceModel(job.sourceCollection);
 
+        const parts = correction.correctedAddress.split(',').map((p) => p.trim()).filter(Boolean);
+        const result = await upsertChecked(correction.postcode, parts, getDateCreated());
+        if (!result.ok) {
+            return res.status(422).json({ success: false, message: result.reason });
+        }
+
+        await SourceModel.findByIdAndDelete(correction.originalId);
         await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, { status: 'approved' });
-        rmAddressLogger.info(`Correction ${req.params.id} approved`);
 
+        rmAddressLogger.info(`Correction ${req.params.id} approved (source: ${job.sourceCollection}) → address_master_checked`);
         return res.json({ success: true });
     } catch (error) {
         rmAddressLogger.error(`approveCorrection failed: ${error.message}`);
@@ -415,26 +526,68 @@ const bulkApproveCorrections = async (req, res) => {
             return res.json({ success: true, approved: 0, message: 'Nothing to approve' });
         }
 
-        const ops = corrections.map((c) => ({
-            updateOne: {
-                filter: { _id: c.originalId },
-                update: {
-                    $set: {
-                        address: JSON.stringify(
-                            c.correctedAddress.split(',').map((p) => p.trim()).filter(Boolean)
-                        ),
-                        correctionVersion: 'v1-ai-corrected'
-                    }
-                }
+        
+        const jobIds = [...new Set(corrections.map((c) => String(c.jobId)))];
+        const jobs = await RMAddressAiJob.find({ _id: { $in: jobIds } }).lean();
+        const jobMap = Object.fromEntries(jobs.map((j) => [String(j._id), j]));
+
+        const uniquePostcodes = [...new Set(corrections.map((c) => c.postcode))];
+        const districtMap = {};
+        for (const pc of uniquePostcodes) districtMap[pc] = await resolveDistrict(pc);
+
+        const dateCreated = getDateCreated();
+        const checkedOps = [];
+        const deletesBySource = {};
+        const approvedIds = [];
+        const skippedIds = [];
+
+        for (const c of corrections) {
+            const district = districtMap[c.postcode];
+            if (!district) {
+                skippedIds.push(c._id);
+                continue;
             }
-        }));
 
-        await AddressMasterMerged.bulkWrite(ops, { ordered: false });
-        await RMAddressAiCorrection.updateMany(query, { $set: { status: 'approved' } });
+            const parts = c.correctedAddress.split(',').map((p) => p.trim()).filter(Boolean);
+            checkedOps.push({
+                updateOne: {
+                    filter: { postcode: c.postcode, address: JSON.stringify(parts) },
+                    update: {
+                        $set: {
+                            postcode: c.postcode,
+                            district,
+                            address: JSON.stringify(parts),
+                            correctionVersion: 'v1-ai-corrected'
+                        },
+                        $setOnInsert: { dateCreated }
+                    },
+                    upsert: true
+                }
+            });
 
-        rmAddressLogger.info(`Bulk approved ${corrections.length} corrections (type: ${correctionType || 'all'})`);
+            const src = jobMap[String(c.jobId)]?.sourceCollection || 'address_master_ai_queue';
+            (deletesBySource[src] ||= []).push(c.originalId);
+            approvedIds.push(c._id);
+        }
 
-        return res.json({ success: true, approved: corrections.length });
+        if (checkedOps.length) {
+            await AddressMasterChecked.bulkWrite(checkedOps, { ordered: false });
+        }
+        for (const [src, ids] of Object.entries(deletesBySource)) {
+            const SourceModel = getSourceModel(src);
+            await SourceModel.deleteMany({ _id: { $in: ids } });
+        }
+        if (approvedIds.length) {
+            await RMAddressAiCorrection.updateMany({ _id: { $in: approvedIds } }, { $set: { status: 'approved' } });
+        }
+
+        if (skippedIds.length) {
+            rmAddressLogger.error(`bulkApproveCorrections: ${skippedIds.length} skipped — no district found for their postcodes`);
+        }
+
+        rmAddressLogger.info(`Bulk approved ${approvedIds.length} corrections → address_master_checked (type: ${correctionType || 'all'})`);
+
+        return res.json({ success: true, approved: approvedIds.length, skipped: skippedIds.length });
     } catch (error) {
         rmAddressLogger.error(`bulkApproveCorrections failed: ${error.message}`);
         return res.status(500).json({ success: false, message: error.message });
@@ -499,10 +652,7 @@ const resolveManualReview = async (req, res) => {
             return res.status(400).json({ success: false, message: `Already resolved: ${item.status}` });
         }
 
-        // ── Restore to the collection it came from ──
-        const TargetModel = item.sourceCollection === 'address_master_pending'
-            ? require('../models/AddressMasterPending')
-            : AddressMasterMerged;
+        const TargetModel = getSourceModel(item.sourceCollection);
 
         if (action === 'restore_original') {
             await TargetModel.create({
@@ -521,13 +671,12 @@ const resolveManualReview = async (req, res) => {
             if (!addressToApply) {
                 return res.status(400).json({ success: false, message: 'No corrected address provided' });
             }
-            await TargetModel.create({
-                postcode: item.postcode,
-                district: item.district,
-                address: JSON.stringify(addressToApply.split(',').map(p => p.trim()).filter(Boolean)),
-                dateCreated: item.dateCreated,
-                correctionVersion: 'v1-ai-corrected'
-            });
+
+            const parts = addressToApply.split(',').map((p) => p.trim()).filter(Boolean);
+            const result = await upsertChecked(item.postcode, parts, item.dateCreated || getDateCreated());
+            if (!result.ok) {
+                return res.status(422).json({ success: false, message: result.reason });
+            }
             await RMAddressManualReview.findByIdAndUpdate(req.params.id, { status: 'applied' });
 
         } else if (action === 'delete_permanently') {
@@ -543,24 +692,6 @@ const resolveManualReview = async (req, res) => {
     }
 };
 
-const formatAddressForAi = (address) => {
-    if (typeof address === 'string' && address.startsWith('[')) {
-        try {
-            const parsed = JSON.parse(address);
-            if (Array.isArray(parsed)) return parsed.join(', ');
-        } catch (e) {}
-    }
-    return address || '';
-};
-
-const groupByPostcode = (records) => {
-    return records.reduce((acc, r) => {
-        if (!acc[r.postcode]) acc[r.postcode] = [];
-        acc[r.postcode].push(r);
-        return acc;
-    }, {});
-};
-
 const applyManualEdit = async (req, res) => {
     try {
         const { manualAddress } = req.body || {};
@@ -574,25 +705,23 @@ const applyManualEdit = async (req, res) => {
             return res.status(400).json({ success: false, message: `Already ${correction.status}` });
         }
 
-        // Apply the human-edited version — not the AI suggestion
-        await AddressMasterMerged.findByIdAndUpdate(
-            correction.originalId,
-            {
-                $set: {
-                    address: JSON.stringify(
-                        manualAddress.trim().split(',').map((p) => p.trim()).filter(Boolean)
-                    ),
-                    correctionVersion: 'v1-manually-edited'
-                }
-            }
-        );
+        const job = await RMAddressAiJob.findById(correction.jobId).lean();
+        if (!job) return res.status(404).json({ success: false, message: 'Parent job not found' });
+        const SourceModel = getSourceModel(job.sourceCollection);
 
+        const parts = manualAddress.trim().split(',').map((p) => p.trim()).filter(Boolean);
+        const result = await upsertChecked(correction.postcode, parts, getDateCreated());
+        if (!result.ok) {
+            return res.status(422).json({ success: false, message: result.reason });
+        }
+
+        await SourceModel.findByIdAndDelete(correction.originalId);
         await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, {
             status: 'manually_edited',
             manualAddress: manualAddress.trim()
         });
 
-        rmAddressLogger.info(`Correction ${req.params.id} manually edited and applied`);
+        rmAddressLogger.info(`Correction ${req.params.id} manually edited and applied (source: ${job.sourceCollection}) → address_master_checked`);
         return res.json({ success: true });
     } catch (error) {
         rmAddressLogger.error(`applyManualEdit failed: ${error.message}`);
@@ -608,11 +737,14 @@ const deleteOriginalAddress = async (req, res) => {
             return res.status(400).json({ success: false, message: `Already ${correction.status}` });
         }
 
-        await AddressMasterMerged.findByIdAndDelete(correction.originalId);
+        const job = await RMAddressAiJob.findById(correction.jobId).lean();
+        if (!job) return res.status(404).json({ success: false, message: 'Parent job not found' });
+        const SourceModel = getSourceModel(job.sourceCollection);
 
+        await SourceModel.findByIdAndDelete(correction.originalId);
         await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, { status: 'deleted' });
 
-        rmAddressLogger.info(`Address ${correction.originalId} deleted via correction ${req.params.id}`);
+        rmAddressLogger.info(`Address ${correction.originalId} deleted via correction ${req.params.id} (source: ${job.sourceCollection})`);
         return res.json({ success: true });
     } catch (error) {
         rmAddressLogger.error(`deleteOriginalAddress failed: ${error.message}`);
@@ -647,39 +779,6 @@ const uploadToPending = async (req, res) => {
 const processPendingFile = async (filePath) => {
     rmAddressLogger.info(`Pending import starting: ${filePath}`);
 
-    const districtCache = new Map();
-
-    const resolveDistrict = async (postcode) => {
-        if (districtCache.has(postcode)) return districtCache.get(postcode);
-        const PostcodeDistrict = require('../models/PostcodeDistrict');
-        const exact = await PostcodeDistrict.findOne({ postcode }).lean();
-        if (exact?.district) {
-            districtCache.set(postcode, exact.district.toUpperCase().trim());
-            return districtCache.get(postcode);
-        }
-        const outward = postcode.split(' ')[0] || '';
-        const prefix  = await PostcodeDistrict.findOne({
-            postcode: { $regex: `^${outward.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s`, $options: 'i' }
-        }).lean();
-        const district = prefix?.district ? prefix.district.toUpperCase().trim() : null;
-        districtCache.set(postcode, district);
-        return district;
-    };
-
-    const normalizePostcode = (v) => {
-        if (!v) return '';
-        const compact = v.toString().trim().toUpperCase().replace(/\s+/g, ' ').replace(/[^A-Z0-9 ]/g, '');
-        if (!compact) return '';
-        const noSpace = compact.replace(/\s+/g, '');
-        if (noSpace.length > 3) return `${noSpace.slice(0, noSpace.length - 3)} ${noSpace.slice(noSpace.length - 3)}`;
-        return compact;
-    };
-
-    const getDate = () => {
-        const now = new Date();
-        return `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
-    };
-
     const parser = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 }).pipe(parse({
         columns: false,
         skip_empty_lines: true,
@@ -693,7 +792,7 @@ const processPendingFile = async (filePath) => {
     let imported = 0;
     let skipped  = 0;
     const BATCH_SIZE  = 2000;
-    const dateCreated = getDate();
+    const dateCreated = getDateCreated();
 
     const flush = async () => {
         if (!batch.length) return;
@@ -733,7 +832,6 @@ const processPendingFile = async (filePath) => {
     }
 
     await flush();
-    districtCache.clear();
 
     rmAddressLogger.info(`Pending import complete: ${imported.toLocaleString()} imported, ${skipped} skipped`);
     await fs.promises.unlink(filePath).catch(() => undefined);
@@ -747,7 +845,6 @@ const getPendingStats = async (req, res) => {
         return res.status(500).json({ success: false, message: error.message });
     }
 };
-
 
 const fixBracketCapitalization = async (req, res) => {
     try {
@@ -843,7 +940,7 @@ module.exports = {
         pauseJob,
         resumeJob,
         resetJob,
-        stopJob, 
+        stopJob,
         deleteJob,
         applyManualEdit,
         deleteOriginalAddress,
@@ -856,8 +953,8 @@ module.exports = {
         bulkRejectCorrections,
         getManualReviewItems,
         resolveManualReview,
-        uploadToPending,           
-        getPendingStats,           
-        fixBracketCapitalization   
+        uploadToPending,
+        getPendingStats,
+        fixBracketCapitalization
     }
 };

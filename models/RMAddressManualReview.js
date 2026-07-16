@@ -20,8 +20,8 @@ const RMAddressManualReviewSchema = new mongoose.Schema({
     },
     sourceCollection: {
     type: String,
-        enum: ['address_master_merged', 'address_master_pending'],
-        default: 'address_master_merged'
+        enum: ['address_master_merged', 'address_master_pending', 'address_master_precheck', 'address_master_ai_queue'],
+        default: 'address_master_ai_queue'
     },
     removedFromMain: { type: Boolean, default: false },
     batchNumber: { type: Number }
