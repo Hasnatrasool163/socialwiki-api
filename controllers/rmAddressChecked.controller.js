@@ -5,7 +5,7 @@ const { addressPartsFromDoc, normalizePostcode } = require('../utils/addressPart
 
 // GET /checked/search?postcode=AB12+3BE
 // Exact-postcode lookup against address_master_checked.
-// Uses the postcode_1__id_1 index for both the filter and the sort.
+// Uses the postcode_1__id_1 index for both the filter and the sort..
 const searchBlock = async (req, res) => {
     try {
         const rawPostcode = req.query.postcode || '';
