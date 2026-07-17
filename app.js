@@ -18,7 +18,7 @@ const propPriceRoutes = require('./routes/propPriceRoutes');
 const rmAddressEditRoutes = require('./routes/rmAddressEditRoutes');
 const rmAddressAiRoutes = require('./routes/rmAddressAiRoutes');
 const rmAddressPrecheckRoutes = require('./routes/rmAddressPrecheckRoutes');
-const rmAddressCheckecdRoutes = require('./routes/rmAddressCheckedRoutes');
+const rmAddressCheckedRoutes = require('./routes/rmAddressCheckedRoutes');
 
 const app = express();
 
