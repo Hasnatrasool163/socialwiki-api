@@ -18,6 +18,7 @@ const propPriceRoutes = require('./routes/propPriceRoutes');
 const rmAddressEditRoutes = require('./routes/rmAddressEditRoutes');
 const rmAddressAiRoutes = require('./routes/rmAddressAiRoutes');
 const rmAddressPrecheckRoutes = require('./routes/rmAddressPrecheckRoutes');
+const rmAddressCheckecdRoutes = require('./routes/rmAddressCheckedRoutes');
 
 const app = express();
 
@@ -98,6 +99,7 @@ app.use('/api/prop-price', verifyToken, authorizeRoles('admin'), propPriceRoutes
 app.use('/api/rm-address/edit', verifyToken, authorizeRoles('admin'), rmAddressEditRoutes);
 app.use('/api/rm-address/ai', rmAddressAiRoutes);
 app.use('/api/rm-address/precheck', rmAddressPrecheckRoutes);
+app.use('/api/rm-address/checked', rmAddressCheckedRoutes);
 app.use('/api/rm-address', rmAddressRoutes); 
 
 app.get('/admin', verifyToken, authorizeRoles('admin'), (req, res) => {
