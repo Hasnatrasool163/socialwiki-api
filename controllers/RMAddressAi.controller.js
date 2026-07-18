@@ -289,7 +289,7 @@ const submitBatchResults = async (req, res) => {
             batchNumber,
             corrections = [],
             manualReview = [],
-            cleanCount = 0 
+            cleanRecords = []
         } = req.body || {};
 
         if (!lastIdInBatch) {
@@ -303,28 +303,21 @@ const submitBatchResults = async (req, res) => {
 
         const SourceModel = getSourceModel(job.sourceCollection);
 
-        // ── Corrections + clean — both staged for admin approval, no DB
-        // change to the source yet (Option B). "Clean" records are staged
-        // exactly like corrections but with correctedAddress === originalAddress
-        // and correctionType 'clean', so they flow through the same
-        // approve/reject/bulk-approve pipeline instead of being silently
-        // auto-promoted. District is deliberately NOT taken from the AI
-        // client for either — it's resolved from PostcodeDistrict at
-        // approval time instead.
-        // const stagedRecords = [
-        //     ...corrections.map((c) => ({ ...c, correctionType: c.correctionType || 'other' })),
-        //     ...clean.map((c) => ({
-        //         originalId: c.originalId,
-        //         postcode: c.postcode,
-        //         originalAddress: c.originalAddress,
-        //         correctedAddress: c.originalAddress,
-        //         correctionType: 'clean',
-        //         confidence: 'high'
-        //     }))
-        // ];
+        // ── Corrections + clean — both staged for admin approval ──
+        const allStagedRecords = [
+            ...corrections,
+            ...cleanRecords.map((c) => ({
+                originalId:       c.originalId,
+                postcode:         c.postcode,
+                originalAddress:  c.originalAddress,
+                correctedAddress: c.originalAddress,
+                correctionType:   'CLEAN',
+                confidence:       'high'
+            }))
+        ];
 
-        if (corrections.length > 0) {
-            const correctionOps = corrections.map((c) => ({
+        if (allStagedRecords.length > 0) {
+            const ops = allStagedRecords.map((c) => ({
                 updateOne: {
                     filter: {
                         jobId:      jobId,
@@ -346,24 +339,19 @@ const submitBatchResults = async (req, res) => {
                     upsert: true
                 }
             }));
-            await RMAddressAiCorrection.bulkWrite(correctionOps, { ordered: false });
+            await RMAddressAiCorrection.bulkWrite(ops, { ordered: false });
         }
 
         // ── Manual review — backup first, then delete ──
         if (manualReview.length > 0) {
             const originalIds = manualReview.map((r) => new mongoose.Types.ObjectId(r.originalId));
 
-            // Step 1: fetch originals from correct collection
-            const originalDocs = await SourceModel.find(
-                { _id: { $in: originalIds } }
-            ).lean();
-
+            const originalDocs = await SourceModel.find({ _id: { $in: originalIds } }).lean();
             const originalDocsMap = {};
             for (const doc of originalDocs) {
                 originalDocsMap[String(doc._id)] = doc;
             }
 
-            // Step 2: insert backups
             const reviewDocs = manualReview.map((r) => {
                 const original = originalDocsMap[r.originalId] || {};
                 return {
@@ -386,41 +374,37 @@ const submitBatchResults = async (req, res) => {
             });
 
             await RMAddressManualReview.insertMany(reviewDocs, { ordered: false });
-
-            // Step 3: delete from source collection
             await SourceModel.deleteMany({ _id: { $in: originalIds } });
-
-            // Step 4: mark backups as confirmed removed
             await RMAddressManualReview.updateMany(
                 { originalId: { $in: originalIds }, jobId },
                 { $set: { removedFromMain: true } }
             );
         }
 
-        // ── Advance job cursor ──
+        // ── Advance job cursor — once, after everything else has succeeded ──
         await RMAddressAiJob.findByIdAndUpdate(jobId, {
             $set: {
                 lastProcessedId: lastIdInBatch,
-                lastPostcode: lastPostcode || ''
+                lastPostcode:    lastPostcode || ''
             },
             $inc: {
-                totalFetched: corrections.length + manualReview.length + clean.length,
+                totalFetched:         allStagedRecords.length + manualReview.length,
                 totalBatchesComplete: 1,
-                totalCorrections: corrections.length,
-                totalManualReview: manualReview.length,
-                totalClean: cleanCount
+                totalCorrections:     corrections.length,
+                totalManualReview:    manualReview.length,
+                totalClean:           cleanRecords.length
             }
         });
 
         rmAddressLogger.info(
             `Batch ${batchNumber} saved for job ${jobId} ` +
             `(source: ${job.sourceCollection}): ` +
-            `${corrections.length} corrections staged, ${manualReview.length} manual, ${clean.length} clean staged for approval`
+            `${corrections.length} corrections staged, ${manualReview.length} manual, ${cleanRecords.length} clean staged for approval`
         );
 
         return res.json({
             success: true,
-            message: `Batch ${batchNumber} saved — ${corrections.length} corrections + ${clean.length} clean staged for approval, ${manualReview.length} manual review`
+            message: `Batch ${batchNumber} saved — ${corrections.length} corrections + ${cleanRecords.length} clean staged for approval, ${manualReview.length} manual review`
         });
 
     } catch (error) {
@@ -428,7 +412,6 @@ const submitBatchResults = async (req, res) => {
         return res.status(500).json({ success: false, message: error.message });
     }
 };
-
 
 const getCorrections = async (req, res) => {
     try {

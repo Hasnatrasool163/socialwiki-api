@@ -29,5 +29,7 @@ const RMAddressManualReviewSchema = new mongoose.Schema({
     collection: 'rm_address_manual_review',
     timestamps: true
 });
+RMAddressManualReviewSchema.index({ jobId: 1, originalId: 1 }, { unique: true })
+
 
 module.exports = mongoose.model('RMAddressManualReview', RMAddressManualReviewSchema);

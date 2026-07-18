@@ -7,6 +7,7 @@ const RMAddressAiCorrectionSchema = new mongoose.Schema({
     originalAddress: { type: String },   
     correctedAddress: { type: String },  
     correctionType: { type: String, index: true },
+    manualAddress: { type: String },
     confidence: {
         type: String,
         enum: ['high', 'medium', 'low'],
@@ -23,5 +24,7 @@ const RMAddressAiCorrectionSchema = new mongoose.Schema({
     collection: 'rm_address_ai_corrections',
     timestamps: true
 });
+
+RMAddressAiCorrectionSchema.index({ jobId: 1, originalId: 1 }, { unique: true });
 
 module.exports = mongoose.model('RMAddressAiCorrection', RMAddressAiCorrectionSchema);
