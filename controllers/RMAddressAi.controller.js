@@ -634,11 +634,76 @@ const bulkRejectCorrections = async (req, res) => {
         if (jobId) query.jobId = jobId;
         if (correctionType) query.correctionType = correctionType;
 
-        const result = await RMAddressAiCorrection.updateMany(query, { $set: { status: 'rejected' } });
+        const corrections = await RMAddressAiCorrection.find(query)
+            .select({
+                _id: 1,
+                jobId: 1,
+                batchNumber: 1,
+                originalId: 1
+            })
+            .lean();
 
-        return res.json({ success: true, rejected: result.modifiedCount });
+        if (!corrections.length) {
+            return res.json({
+                success: true,
+                rejected: 0,
+                message: 'Nothing to reject'
+            });
+        }
+
+        await RMAddressAiCorrection.updateMany(
+            {
+                _id: { $in: corrections.map(c => c._id) }
+            },
+            {
+                $set: { status: 'rejected' }
+            }
+        );
+
+        await AddressMasterAiTemp.updateMany(
+            {
+                originalId: {
+                    $in: corrections.map(c => c.originalId)
+                }
+            },
+            {
+                $set: {
+                    recordStatus: 'resolved'
+                }
+            }
+        );
+
+        const affectedBatches = new Map();
+
+        for (const c of corrections) {
+            affectedBatches.set(
+                `${String(c.jobId)}_${c.batchNumber}`,
+                {
+                    jobId: c.jobId,
+                    batchNumber: c.batchNumber
+                }
+            );
+        }
+
+        for (const { jobId, batchNumber } of affectedBatches.values()) {
+            await checkAndConfirmBatch(jobId, batchNumber);
+        }
+
+        rmAddressLogger.info(
+            `Bulk rejected ${corrections.length} corrections (type: ${correctionType || 'all'})`
+        );
+
+        return res.json({
+            success: true,
+            rejected: corrections.length
+        });
+
     } catch (error) {
-        return res.status(500).json({ success: false, message: error.message });
+        rmAddressLogger.error(`bulkRejectCorrections failed: ${error.message}`);
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
     }
 };
 
@@ -999,48 +1064,133 @@ const deleteJob = async (req, res) => {
     }
 };
 
-const checkAndConfirmBatch = async (jobId, batchNumber) => {
-    const pendingCount = await AddressMasterAiTemp.countDocuments({
-        jobId,
-        batchNumber,
-        recordStatus: { $in: ['pending_correction', 'pending_manual_review'] }
-    });
+const bulkApproveCorrections = async (req, res) => {
+    try {
+        const { jobId, correctionType } = req.body || {};
 
-    if (pendingCount > 0) return; // still work to do
+        const query = { status: 'pending' };
+        if (jobId) query.jobId = jobId;
+        if (correctionType) query.correctionType = correctionType;
 
-    const tempRecords = await AddressMasterAiTemp.find({ jobId, batchNumber }).lean();
-    if (!tempRecords.length) return;
-
-    const job = await RMAddressAiJob.findById(jobId).lean();
-    const SourceModel = getSourceModel(job?.sourceCollection || 'address_master_ai_queue');
-
-    const dateCreated = getDateCreated();
-    const checkedOps  = tempRecords.map(r => ({
-        updateOne: {
-            filter: { postcode: r.postcode, address: r.address },
-            update: { $set: {
-                postcode:          r.postcode,
-                district:          r.district,
-                address:           r.address,
-                dateCreated:       r.dateCreated || dateCreated,
-                correctionVersion: r.correctionVersion || 'v1-ai-corrected',
-                sourceType:        'ai_approved'
-            }},
-            upsert: true
+        const corrections = await RMAddressAiCorrection.find(query).lean();
+        if (!corrections.length) {
+            return res.json({ success: true, approved: 0, message: 'Nothing to approve' });
         }
-    }));
 
-    await AddressMasterChecked.bulkWrite(checkedOps, { ordered: false });
+        const jobIds = [...new Set(corrections.map((c) => String(c.jobId)))];
+        const jobs = await RMAddressAiJob.find({ _id: { $in: jobIds } }).lean();
+        const jobMap = Object.fromEntries(jobs.map((j) => [String(j._id), j]));
 
-    const originalIds = tempRecords.map(r => r.originalId);
-    await SourceModel.deleteMany({ _id: { $in: originalIds } });
+        const uniquePostcodes = [...new Set(corrections.map((c) => c.postcode))];
+        const districtMap = {};
+        for (const pc of uniquePostcodes) {
+            districtMap[pc] = await resolveDistrict(pc);
+        }
 
-    await AddressMasterAiTemp.deleteMany({ jobId, batchNumber });
+        const dateCreated = getDateCreated();
+        const checkedOps = [];
+        const deletesBySource = {};
+        const approvedIds = [];
+        const resolvedOriginalIds = [];
+        const skippedIds = [];
+        const affectedBatches = new Map();
 
-    rmAddressLogger.info(
-        `Batch ${batchNumber} job ${jobId} auto-confirmed: ` +
-        `${tempRecords.length} records → address_master_checked (source: ${job?.sourceCollection || 'unknown'})`
-    );
+        for (const c of corrections) {
+            const district = districtMap[c.postcode];
+            if (!district) {
+                skippedIds.push(c._id);
+                continue;
+            }
+
+            const parts = c.correctedAddress
+                .split(',')
+                .map((p) => p.trim())
+                .filter(Boolean);
+
+            checkedOps.push({
+                updateOne: {
+                    filter: {
+                        postcode: c.postcode,
+                        address: JSON.stringify(parts)
+                    },
+                    update: {
+                        $set: {
+                            postcode: c.postcode,
+                            district,
+                            address: JSON.stringify(parts),
+                            correctionVersion: 'v1-ai-corrected'
+                        },
+                        $setOnInsert: {
+                            dateCreated
+                        }
+                    },
+                    upsert: true
+                }
+            });
+
+            const src = jobMap[String(c.jobId)]?.sourceCollection || 'address_master_ai_queue';
+            (deletesBySource[src] ||= []).push(c.originalId);
+
+            approvedIds.push(c._id);
+            resolvedOriginalIds.push(c.originalId);
+
+            affectedBatches.set(
+                `${String(c.jobId)}_${c.batchNumber}`,
+                {
+                    jobId: c.jobId,
+                    batchNumber: c.batchNumber
+                }
+            );
+        }
+
+        if (checkedOps.length) {
+            await AddressMasterChecked.bulkWrite(checkedOps, { ordered: false });
+        }
+
+        for (const [src, ids] of Object.entries(deletesBySource)) {
+            const SourceModel = getSourceModel(src);
+            await SourceModel.deleteMany({ _id: { $in: ids } });
+        }
+
+        if (approvedIds.length) {
+            await RMAddressAiCorrection.updateMany(
+                { _id: { $in: approvedIds } },
+                { $set: { status: 'approved' } }
+            );
+
+            await AddressMasterAiTemp.updateMany(
+                { originalId: { $in: resolvedOriginalIds } },
+                { $set: { recordStatus: 'resolved' } }
+            );
+        }
+
+        for (const { jobId, batchNumber } of affectedBatches.values()) {
+            await checkAndConfirmBatch(jobId, batchNumber);
+        }
+
+        if (skippedIds.length) {
+            rmAddressLogger.error(
+                `bulkApproveCorrections: ${skippedIds.length} skipped — no district found for their postcodes`
+            );
+        }
+
+        rmAddressLogger.info(
+            `Bulk approved ${approvedIds.length} corrections → address_master_checked (type: ${correctionType || 'all'})`
+        );
+
+        return res.json({
+            success: true,
+            approved: approvedIds.length,
+            skipped: skippedIds.length
+        });
+
+    } catch (error) {
+        rmAddressLogger.error(`bulkApproveCorrections failed: ${error.message}`);
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
 };
 
 module.exports = {
