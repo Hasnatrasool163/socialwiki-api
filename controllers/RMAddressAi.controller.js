@@ -5,7 +5,9 @@ const RMAddressManualReview = require('../models/RMAddressManualReview');
 const AddressMasterMerged = require('../models/AddressMasterMerged');
 const AddressMasterChecked = require('../models/AddressMasterChecked');
 const AddressMasterPending = require('../models/AddressMasterPending');
+const AddressMasterAiTemp = require('../models/AddressMasterAiTemp');
 const PostcodeDistrict = require('../models/PostcodeDistrict');
+const AddressMasterAiQueue = require('../models/AddressMasterAiQueue');
 const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 const { parse } = require('csv-parse');
 const fs = require('fs');
@@ -287,9 +289,10 @@ const submitBatchResults = async (req, res) => {
             lastIdInBatch,
             lastPostcode,
             batchNumber,
-            corrections = [],
-            manualReview = [],
-            cleanRecords = []
+            corrections    = [],
+            manualReview   = [],
+            cleanCount     = 0,
+            batchRecordIds = []
         } = req.body || {};
 
         if (!lastIdInBatch) {
@@ -297,30 +300,54 @@ const submitBatchResults = async (req, res) => {
         }
 
         const job = await RMAddressAiJob.findById(jobId).lean();
-        if (!job) {
-            return res.status(404).json({ success: false, message: 'Job not found' });
-        }
+        if (!job) return res.status(404).json({ success: false, message: 'Job not found' });
 
         const SourceModel = getSourceModel(job.sourceCollection);
 
-        // ── Corrections + clean — both staged for admin approval ──
-        const allStagedRecords = [
-            ...corrections,
-            ...cleanRecords.map((c) => ({
-                originalId:       c.originalId,
-                postcode:         c.postcode,
-                originalAddress:  c.originalAddress,
-                correctedAddress: c.originalAddress,
-                correctionType:   'CLEAN',
-                confidence:       'high'
-            }))
-        ];
+        // ── Step 1: Copy entire batch to TEMP collection ──
+        if (batchRecordIds.length > 0) {
+            const originalIds  = batchRecordIds.map(id => new mongoose.Types.ObjectId(id));
+            const originalDocs = await SourceModel.find({ _id: { $in: originalIds } }).lean();
 
-        if (allStagedRecords.length > 0) {
-            const ops = allStagedRecords.map((c) => ({
+            const correctionIdSet    = new Set(corrections.map(c => c.originalId));
+            const manualReviewIdSet  = new Set(manualReview.map(r => r.originalId));
+
+            const tempOps = originalDocs.map(doc => {
+                const idStr = String(doc._id);
+                let recordStatus = 'clean';
+                if (correctionIdSet.has(idStr))   recordStatus = 'pending_correction';
+                if (manualReviewIdSet.has(idStr))  recordStatus = 'pending_manual_review';
+
+                return {
+                    updateOne: {
+                        filter: { originalId: doc._id },
+                        update: { $setOnInsert: {
+                            jobId:        new mongoose.Types.ObjectId(jobId),
+                            batchNumber,
+                            originalId:   doc._id,
+                            postcode:     doc.postcode,
+                            district:     doc.district,
+                            address:      doc.address,
+                            dateCreated:  doc.dateCreated,
+                            correctionVersion: doc.correctionVersion || 'v1',
+                            recordStatus
+                        }},
+                        upsert: true
+                    }
+                };
+            });
+
+            if (tempOps.length) {
+                await AddressMasterAiTemp.bulkWrite(tempOps, { ordered: false });
+            }
+        }
+
+        // ── Step 2: Stage corrections for admin review ──
+        if (corrections.length > 0) {
+            const correctionOps = corrections.map(c => ({
                 updateOne: {
                     filter: {
-                        jobId:      jobId,
+                        jobId,
                         originalId: new mongoose.Types.ObjectId(c.originalId)
                     },
                     update: {
@@ -339,36 +366,31 @@ const submitBatchResults = async (req, res) => {
                     upsert: true
                 }
             }));
-            await RMAddressAiCorrection.bulkWrite(ops, { ordered: false });
+            await RMAddressAiCorrection.bulkWrite(correctionOps, { ordered: false });
         }
 
-        // ── Manual review — backup first, then delete ──
+        // ── Step 3: Backup manual review records then delete from source ──
         if (manualReview.length > 0) {
-            const originalIds = manualReview.map((r) => new mongoose.Types.ObjectId(r.originalId));
-
+            const originalIds  = manualReview.map(r => new mongoose.Types.ObjectId(r.originalId));
             const originalDocs = await SourceModel.find({ _id: { $in: originalIds } }).lean();
-            const originalDocsMap = {};
-            for (const doc of originalDocs) {
-                originalDocsMap[String(doc._id)] = doc;
-            }
+            const docsMap      = Object.fromEntries(originalDocs.map(d => [String(d._id), d]));
 
-            const reviewDocs = manualReview.map((r) => {
-                const original = originalDocsMap[r.originalId] || {};
+            const reviewDocs = manualReview.map(r => {
+                const original = docsMap[r.originalId] || {};
                 return {
                     jobId,
-                    originalId: new mongoose.Types.ObjectId(r.originalId),
-                    sourceCollection: job.sourceCollection || 'address_master_ai_queue',
-                    postcode: original.postcode,
-                    district: original.district,
-                    address: original.address,
-                    dateCreated: original.dateCreated,
-                    correctionVersion: original.correctionVersion,
-                    exceptionVersion: original.exceptionVersion,
+                    originalId:         new mongoose.Types.ObjectId(r.originalId),
+                    sourceCollection:   job.sourceCollection || 'address_master_ai_queue',
+                    postcode:           original.postcode,
+                    district:           original.district,
+                    address:            original.address,
+                    dateCreated:        original.dateCreated,
+                    correctionVersion:  original.correctionVersion,
                     aiOriginalFormatted: r.originalAddress,
                     aiSuggestedAddress: r.suggestedAddress || '',
-                    reason: r.reason,
-                    status: 'pending',
-                    removedFromMain: false,
+                    reason:             r.reason,
+                    status:             'pending',
+                    removedFromMain:    false,
                     batchNumber
                 };
             });
@@ -381,30 +403,38 @@ const submitBatchResults = async (req, res) => {
             );
         }
 
-        // ── Advance job cursor — once, after everything else has succeeded ──
+        // ── Step 4: If batch is entirely clean → confirm immediately ──
+        if (corrections.length === 0 && manualReview.length === 0) {
+            await checkAndConfirmBatch(
+                new mongoose.Types.ObjectId(jobId),
+                batchNumber
+            );
+        }
+
+        // ── Advance job cursor ──
         await RMAddressAiJob.findByIdAndUpdate(jobId, {
             $set: {
                 lastProcessedId: lastIdInBatch,
                 lastPostcode:    lastPostcode || ''
             },
             $inc: {
-                totalFetched:         allStagedRecords.length + manualReview.length,
+                totalFetched:         (batchRecordIds.length || 0),
                 totalBatchesComplete: 1,
                 totalCorrections:     corrections.length,
                 totalManualReview:    manualReview.length,
-                totalClean:           cleanRecords.length
+                totalClean:           cleanCount
             }
         });
 
         rmAddressLogger.info(
-            `Batch ${batchNumber} saved for job ${jobId} ` +
-            `(source: ${job.sourceCollection}): ` +
-            `${corrections.length} corrections staged, ${manualReview.length} manual, ${cleanRecords.length} clean staged for approval`
+            `Batch ${batchNumber} saved for job ${jobId}: ` +
+            `${corrections.length} corrections, ${manualReview.length} manual, ` +
+            `${cleanCount} clean, ${batchRecordIds.length} total in batch`
         );
 
         return res.json({
             success: true,
-            message: `Batch ${batchNumber} saved — ${corrections.length} corrections + ${cleanRecords.length} clean staged for approval, ${manualReview.length} manual review`
+            message: `Batch ${batchNumber} saved — ${corrections.length} corrections staged, ${manualReview.length} manual review, ${cleanCount} clean`
         });
 
     } catch (error) {
@@ -464,18 +494,27 @@ const approveCorrection = async (req, res) => {
 
         const job = await RMAddressAiJob.findById(correction.jobId).lean();
         if (!job) return res.status(404).json({ success: false, message: 'Parent job not found' });
-        const SourceModel = getSourceModel(job.sourceCollection);
 
-        const parts = correction.correctedAddress.split(',').map((p) => p.trim()).filter(Boolean);
-        const result = await upsertChecked(correction.postcode, parts, getDateCreated());
-        if (!result.ok) {
-            return res.status(422).json({ success: false, message: result.reason });
-        }
+        // Apply correction to the temp record
+        await AddressMasterAiTemp.updateOne(
+            { originalId: correction.originalId },
+            { $set: {
+                address:      JSON.stringify(
+                    correction.correctedAddress.split(',').map(p => p.trim()).filter(Boolean)
+                ),
+                recordStatus: 'resolved'
+            }}
+        );
 
-        await SourceModel.findByIdAndDelete(correction.originalId);
         await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, { status: 'approved' });
+        rmAddressLogger.info(`Correction ${req.params.id} approved`);
 
-        rmAddressLogger.info(`Correction ${req.params.id} approved (source: ${job.sourceCollection}) → address_master_checked`);
+        // Check if entire batch is now resolved — auto-confirms if so
+        await checkAndConfirmBatch(
+            new mongoose.Types.ObjectId(String(correction.jobId)),
+            correction.batchNumber
+        );
+
         return res.json({ success: true });
     } catch (error) {
         rmAddressLogger.error(`approveCorrection failed: ${error.message}`);
@@ -488,7 +527,17 @@ const rejectCorrection = async (req, res) => {
         const correction = await RMAddressAiCorrection.findById(req.params.id);
         if (!correction) return res.status(404).json({ success: false, message: 'Not found' });
 
+        await AddressMasterAiTemp.updateOne(
+            { originalId: correction.originalId },
+            { $set: { recordStatus: 'resolved' } }
+        );
+
         await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, { status: 'rejected' });
+
+        await checkAndConfirmBatch(
+            new mongoose.Types.ObjectId(String(correction.jobId)),
+            correction.batchNumber
+        );
 
         return res.json({ success: true });
     } catch (error) {
@@ -663,9 +712,28 @@ const resolveManualReview = async (req, res) => {
             await RMAddressManualReview.findByIdAndUpdate(req.params.id, { status: 'applied' });
 
         } else if (action === 'delete_permanently') {
+            await AddressMasterAiTemp.deleteOne({ originalId: item.originalId });
             await RMAddressManualReview.findByIdAndUpdate(req.params.id, { status: 'deleted_permanently' });
+            
         } else {
             return res.status(400).json({ success: false, message: `Unknown action: ${action}` });
+        }
+
+        await AddressMasterAiTemp.updateOne(
+            { originalId: item.originalId },
+            { $set: { recordStatus: 'resolved' } }
+        );
+
+        // Resolve the batch if all items are done
+        const correction = await RMAddressAiCorrection.findOne({
+            originalId: item.originalId
+        }).lean();
+
+        if (correction) {
+            await checkAndConfirmBatch(
+                new mongoose.Types.ObjectId(String(item.jobId)),
+                correction.batchNumber
+            );
         }
 
         return res.json({ success: true });
@@ -690,21 +758,31 @@ const applyManualEdit = async (req, res) => {
 
         const job = await RMAddressAiJob.findById(correction.jobId).lean();
         if (!job) return res.status(404).json({ success: false, message: 'Parent job not found' });
-        const SourceModel = getSourceModel(job.sourceCollection);
 
         const parts = manualAddress.trim().split(',').map((p) => p.trim()).filter(Boolean);
-        const result = await upsertChecked(correction.postcode, parts, getDateCreated());
-        if (!result.ok) {
-            return res.status(422).json({ success: false, message: result.reason });
-        }
 
-        await SourceModel.findByIdAndDelete(correction.originalId);
+        // Apply the manual edit to the temp record — NOT directly to checked
+        await AddressMasterAiTemp.updateOne(
+            { originalId: correction.originalId },
+            { $set: {
+                address:      JSON.stringify(parts),
+                recordStatus: 'resolved'
+            }}
+        );
+
         await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, {
             status: 'manually_edited',
             manualAddress: manualAddress.trim()
         });
 
-        rmAddressLogger.info(`Correction ${req.params.id} manually edited and applied (source: ${job.sourceCollection}) → address_master_checked`);
+        rmAddressLogger.info(`Correction ${req.params.id} manually edited (source: ${job.sourceCollection})`);
+
+        // Check if entire batch is now resolved — auto-confirms if so
+        await checkAndConfirmBatch(
+            new mongoose.Types.ObjectId(String(correction.jobId)),
+            correction.batchNumber
+        );
+
         return res.json({ success: true });
     } catch (error) {
         rmAddressLogger.error(`applyManualEdit failed: ${error.message}`);
@@ -722,12 +800,18 @@ const deleteOriginalAddress = async (req, res) => {
 
         const job = await RMAddressAiJob.findById(correction.jobId).lean();
         if (!job) return res.status(404).json({ success: false, message: 'Parent job not found' });
-        const SourceModel = getSourceModel(job.sourceCollection);
 
-        await SourceModel.findByIdAndDelete(correction.originalId);
+        await AddressMasterAiTemp.deleteOne({ originalId: correction.originalId });
+
         await RMAddressAiCorrection.findByIdAndUpdate(req.params.id, { status: 'deleted' });
 
         rmAddressLogger.info(`Address ${correction.originalId} deleted via correction ${req.params.id} (source: ${job.sourceCollection})`);
+
+        await checkAndConfirmBatch(
+            new mongoose.Types.ObjectId(String(correction.jobId)),
+            correction.batchNumber
+        );
+
         return res.json({ success: true });
     } catch (error) {
         rmAddressLogger.error(`deleteOriginalAddress failed: ${error.message}`);
@@ -913,6 +997,50 @@ const deleteJob = async (req, res) => {
         rmAddressLogger.error(`deleteJob failed: ${error.message}`);
         return res.status(500).json({ success: false, message: error.message });
     }
+};
+
+const checkAndConfirmBatch = async (jobId, batchNumber) => {
+    const pendingCount = await AddressMasterAiTemp.countDocuments({
+        jobId,
+        batchNumber,
+        recordStatus: { $in: ['pending_correction', 'pending_manual_review'] }
+    });
+
+    if (pendingCount > 0) return; // still work to do
+
+    const tempRecords = await AddressMasterAiTemp.find({ jobId, batchNumber }).lean();
+    if (!tempRecords.length) return;
+
+    const job = await RMAddressAiJob.findById(jobId).lean();
+    const SourceModel = getSourceModel(job?.sourceCollection || 'address_master_ai_queue');
+
+    const dateCreated = getDateCreated();
+    const checkedOps  = tempRecords.map(r => ({
+        updateOne: {
+            filter: { postcode: r.postcode, address: r.address },
+            update: { $set: {
+                postcode:          r.postcode,
+                district:          r.district,
+                address:           r.address,
+                dateCreated:       r.dateCreated || dateCreated,
+                correctionVersion: r.correctionVersion || 'v1-ai-corrected',
+                sourceType:        'ai_approved'
+            }},
+            upsert: true
+        }
+    }));
+
+    await AddressMasterChecked.bulkWrite(checkedOps, { ordered: false });
+
+    const originalIds = tempRecords.map(r => r.originalId);
+    await SourceModel.deleteMany({ _id: { $in: originalIds } });
+
+    await AddressMasterAiTemp.deleteMany({ jobId, batchNumber });
+
+    rmAddressLogger.info(
+        `Batch ${batchNumber} job ${jobId} auto-confirmed: ` +
+        `${tempRecords.length} records → address_master_checked (source: ${job?.sourceCollection || 'unknown'})`
+    );
 };
 
 module.exports = {
