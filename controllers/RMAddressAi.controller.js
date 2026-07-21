@@ -12,7 +12,7 @@ const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 const { parse } = require('csv-parse');
 const fs = require('fs');
 
-const BATCH_TARGET = 300;
+const BATCH_TARGET = 200;
 
 const districtCache = new Map();
 
