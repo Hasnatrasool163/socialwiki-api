@@ -1217,8 +1217,12 @@ const getBlockContext = async (req, res) => {
             }).lean()
         ]);
 
-        const correctionMap   = Object.fromEntries(corrections.map(c => [String(c.originalId), c]));
-        const manualReviewMap = Object.fromEntries(manualItems.map(m => [String(m.originalId), m]));
+        const correctionMap   = Object.fromEntries(
+            corrections.map(c => [`${c.jobId}_${c.originalId}`, c])
+        );
+        const manualReviewMap = Object.fromEntries(
+            manualItems.map(m => [`${m.jobId}_${m.originalId}`, m])
+        );
 
         const addressPartsFromDoc = (address) => {
             if (typeof address === 'string' && address.startsWith('[')) {
@@ -1231,13 +1235,13 @@ const getBlockContext = async (req, res) => {
         };
 
         const records = tempRecords.map(r => {
-            const idStr      = String(r.originalId);
-            const correction = correctionMap[idStr];
-            const manual     = manualReviewMap[idStr];
+            const key        = `${r.jobId}_${r.originalId}`;  
+            const correction = correctionMap[key];
+            const manual     = manualReviewMap[key];
 
             return {
                 _id:          String(r._id),
-                originalId:   idStr,
+                originalId:   String(r.originalId),
                 postcode:     r.postcode,
                 district:     r.district,
                 address:      addressPartsFromDoc(r.address),
@@ -1249,10 +1253,10 @@ const getBlockContext = async (req, res) => {
                     status:           correction.status
                 } : null,
                 manualReview: manual ? {
-                    _id:              String(manual._id),
-                    reason:           manual.reason,
+                    _id:                String(manual._id),
+                    reason:             manual.reason,
                     aiSuggestedAddress: manual.aiSuggestedAddress || '',
-                    status:           manual.status
+                    status:             manual.status
                 } : null
             };
         });
