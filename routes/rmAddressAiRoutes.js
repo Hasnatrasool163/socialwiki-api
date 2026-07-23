@@ -68,4 +68,7 @@ router.post('/corrections/:id/delete-address', RMAddressAiController.deleteOrigi
 
 router.post('/tools/fix-bracket-caps', RMAddressAiController.fixBracketCapitalization);
 
+router.get('/manual-review/postcodes', RMAddressAiController.getPendingPostcodes);
+router.get('/block-context/:postcode',  RMAddressAiController.getBlockContext);
+
 module.exports = router;

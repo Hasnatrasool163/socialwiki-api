@@ -1156,6 +1156,112 @@ const checkAndConfirmBatch = async (jobId, batchNumber) => {
     );
 };
 
+// GET /api/rm-address/ai/manual-review/postcodes
+// Returns distinct postcodes that have pending manual review items
+// so the left sidebar can list them with counts
+const getPendingPostcodes = async (req, res) => {
+    try {
+        const { jobId } = req.query;
+        const match = { status: 'pending' };
+        if (jobId) match.jobId = new mongoose.Types.ObjectId(jobId);
+
+        const results = await RMAddressManualReview.aggregate([
+            { $match: match },
+            {
+                $group: {
+                    _id:   '$postcode',
+                    count: { $sum: 1 }
+                }
+            },
+            { $sort: { _id: 1 } }
+        ]);
+
+        return res.json({
+            success:   true,
+            postcodes: results.map(r => ({ postcode: r._id, count: r.count }))
+        });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// GET /api/rm-address/ai/block-context/:postcode
+// Returns the full set of temp records for a postcode block
+// so the UI can show all 350 records alongside the 1-2 flagged ones
+const getBlockContext = async (req, res) => {
+    try {
+        const postcode = decodeURIComponent(req.params.postcode);
+        const { jobId } = req.query;
+
+        const tempQuery = { postcode };
+        if (jobId) tempQuery.jobId = new mongoose.Types.ObjectId(jobId);
+
+        const [tempRecords, corrections, manualItems] = await Promise.all([
+            AddressMasterAiTemp.find(tempQuery)
+                .sort({ _id: 1 })
+                .lean(),
+            RMAddressAiCorrection.find({
+                postcode,
+                status: 'pending',
+                ...(jobId ? { jobId } : {})
+            }).lean(),
+            RMAddressManualReview.find({
+                postcode,
+                status: 'pending',
+                ...(jobId ? { jobId: new mongoose.Types.ObjectId(jobId) } : {})
+            }).lean()
+        ]);
+
+        const correctionMap   = Object.fromEntries(corrections.map(c => [String(c.originalId), c]));
+        const manualReviewMap = Object.fromEntries(manualItems.map(m => [String(m.originalId), m]));
+
+        const addressPartsFromDoc = (address) => {
+            if (typeof address === 'string' && address.startsWith('[')) {
+                try {
+                    const parsed = JSON.parse(address);
+                    if (Array.isArray(parsed)) return parsed.join(', ');
+                } catch (e) {}
+            }
+            return address || '';
+        };
+
+        const records = tempRecords.map(r => {
+            const idStr      = String(r.originalId);
+            const correction = correctionMap[idStr];
+            const manual     = manualReviewMap[idStr];
+
+            return {
+                _id:          String(r._id),
+                originalId:   idStr,
+                postcode:     r.postcode,
+                district:     r.district,
+                address:      addressPartsFromDoc(r.address),
+                recordStatus: r.recordStatus,
+                correction:   correction ? {
+                    _id:              String(correction._id),
+                    correctedAddress: correction.correctedAddress,
+                    correctionType:   correction.correctionType,
+                    status:           correction.status
+                } : null,
+                manualReview: manual ? {
+                    _id:    String(manual._id),
+                    reason: manual.reason,
+                    status: manual.status
+                } : null
+            };
+        });
+
+        return res.json({
+            success:     true,
+            postcode,
+            recordCount: records.length,
+            records
+        });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 module.exports = {
     RMAddressAiController: {
         createJob,
@@ -1179,6 +1285,8 @@ module.exports = {
         resolveManualReview,
         uploadToPending,
         getPendingStats,
-        fixBracketCapitalization
+        fixBracketCapitalization,
+        getPendingPostcodes,
+        getBlockContext
     }
 };
