@@ -758,12 +758,13 @@ const bulkRejectCorrections = async (req, res) => {
 
 const getManualReviewItems = async (req, res) => {
     try {
-        const { jobId, status = 'pending', page = 1, limit = 50 } = req.query;
+        const { jobId, status = 'pending', postcode, page = 1, limit = 50 } = req.query;
 
         const query = { status };
-        if (jobId) query.jobId = jobId;
+        if (jobId)   query.jobId   = jobId;
+        if (postcode) query.postcode = postcode;   
 
-        const pageNum = parseInt(page);
+        const pageNum  = parseInt(page);
         const limitNum = parseInt(limit);
 
         const [items, total] = await Promise.all([
@@ -776,10 +777,10 @@ const getManualReviewItems = async (req, res) => {
         ]);
 
         return res.json({
-            success: true,
+            success:    true,
             items,
             total,
-            page: pageNum,
+            page:       pageNum,
             totalPages: Math.ceil(total / limitNum)
         });
     } catch (error) {
