@@ -1192,9 +1192,7 @@ const getPendingPostcodes = async (req, res) => {
 const getBlockContext = async (req, res) => {
     try {
         const postcode = decodeURIComponent(req.params.postcode);
-
-        const tempQuery = { postcode };
-        const tempRecords = await AddressMasterAiTemp.find(tempQuery)
+        const tempRecords = await AddressMasterAiTemp.find({ postcode })
             .sort({ _id: 1 })
             .lean();
 
@@ -1208,12 +1206,12 @@ const getBlockContext = async (req, res) => {
             RMAddressAiCorrection.find({
                 postcode,
                 status: 'pending',
-                jobId:  { $in: jobIds }    
+                jobId:  { $in: jobIds }
             }).lean(),
             RMAddressManualReview.find({
                 postcode,
                 status: 'pending',
-                jobId:  { $in: jobIds.map(id => new mongoose.Types.ObjectId(id)) }  
+                jobId:  { $in: jobIds.map(id => new mongoose.Types.ObjectId(id)) }
             }).lean()
         ]);
 
@@ -1235,7 +1233,7 @@ const getBlockContext = async (req, res) => {
         };
 
         const records = tempRecords.map(r => {
-            const key        = `${r.jobId}_${r.originalId}`;  
+            const key        = `${r.jobId}_${r.originalId}`;
             const correction = correctionMap[key];
             const manual     = manualReviewMap[key];
 
