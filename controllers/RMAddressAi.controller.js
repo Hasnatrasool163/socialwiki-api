@@ -1192,24 +1192,28 @@ const getPendingPostcodes = async (req, res) => {
 const getBlockContext = async (req, res) => {
     try {
         const postcode = decodeURIComponent(req.params.postcode);
-        const { jobId } = req.query;
 
         const tempQuery = { postcode };
-        if (jobId) tempQuery.jobId = new mongoose.Types.ObjectId(jobId);
+        const tempRecords = await AddressMasterAiTemp.find(tempQuery)
+            .sort({ _id: 1 })
+            .lean();
 
-        const [tempRecords, corrections, manualItems] = await Promise.all([
-            AddressMasterAiTemp.find(tempQuery)
-                .sort({ _id: 1 })
-                .lean(),
+        if (!tempRecords.length) {
+            return res.json({ success: true, postcode, recordCount: 0, records: [] });
+        }
+
+        const jobIds = [...new Set(tempRecords.map(r => String(r.jobId)))];
+
+        const [corrections, manualItems] = await Promise.all([
             RMAddressAiCorrection.find({
                 postcode,
                 status: 'pending',
-                ...(jobId ? { jobId } : {})
+                jobId:  { $in: jobIds }    
             }).lean(),
             RMAddressManualReview.find({
                 postcode,
                 status: 'pending',
-                ...(jobId ? { jobId: new mongoose.Types.ObjectId(jobId) } : {})
+                jobId:  { $in: jobIds.map(id => new mongoose.Types.ObjectId(id)) }  
             }).lean()
         ]);
 
@@ -1245,9 +1249,10 @@ const getBlockContext = async (req, res) => {
                     status:           correction.status
                 } : null,
                 manualReview: manual ? {
-                    _id:    String(manual._id),
-                    reason: manual.reason,
-                    status: manual.status
+                    _id:              String(manual._id),
+                    reason:           manual.reason,
+                    aiSuggestedAddress: manual.aiSuggestedAddress || '',
+                    status:           manual.status
                 } : null
             };
         });
