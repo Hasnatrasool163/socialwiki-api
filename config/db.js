@@ -26,6 +26,7 @@ const connectDB = async () => {
             maxPoolSize: 10,
             retryWrites: true,
             w: 'majority',
+            autoIndex: false,
         };
 
         // Connect with timeout

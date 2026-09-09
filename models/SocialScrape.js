@@ -24,21 +24,25 @@ const socialScrapeSchema = new mongoose.Schema({
   is_blacklisted: { type: Boolean, default: false },
   is_adult_content: { type: Boolean },
 
-}, { timestamps: true, collection: 'socialscrapes', strict: false });
+}, { timestamps: true, collection: 'socialscrapes', strict: false, autoIndex: false });
 
 // Add compound unique index on URL + date to allow multiple records with same URL but different dates
 socialScrapeSchema.index({ url: 1, date: 1 }, { unique: true, background: true });
-
-// Add index on date for sorting
-socialScrapeSchema.index({ date: -1 }, { background: true })
 
 // Add index on phone.number for fast search
 socialScrapeSchema.index({ 'phone.number': 1 }, { background: true });
 
 socialScrapeSchema.index({ is_blacklisted: 1 }, { background: true });
 
-// Add text index for fast URL search
-socialScrapeSchema.index({ url: 'text' }, { background: true });
+// Unified multi-field text search index
+socialScrapeSchema.index(
+  {
+    url: 'text', email: 'text', postcode: 'text',
+    twitter: 'text', facebook: 'text', instagram: 'text',
+    linkedin: 'text', pinterest: 'text', youtube: 'text'
+  },
+  { background: true, name: 'idx_social_search_text' }
+);
 
 // Add error handling for duplicate key errors
 socialScrapeSchema.post('save', function (error, doc, next) {
@@ -49,6 +53,6 @@ socialScrapeSchema.post('save', function (error, doc, next) {
   }
 });
 
-const SocialScrape = mongoose.model('SocialScrape', socialScrapeSchema);
+const SocialScrape = mongoose.models.SocialScrape || mongoose.model('SocialScrape', socialScrapeSchema);
 
 module.exports = SocialScrape;
