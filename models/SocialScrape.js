@@ -34,7 +34,17 @@ socialScrapeSchema.index({ 'phone.number': 1 }, { background: true });
 
 socialScrapeSchema.index({ is_blacklisted: 1 }, { background: true });
 
-// Unified multi-field text search index
+// Sparse B-Tree indexes for exact-match lookups (keeps indexes tiny & fast)
+socialScrapeSchema.index({ email: 1 }, { background: true, sparse: true });
+socialScrapeSchema.index({ postcode: 1 }, { background: true, sparse: true });
+socialScrapeSchema.index({ twitter: 1 }, { background: true, sparse: true });
+socialScrapeSchema.index({ facebook: 1 }, { background: true, sparse: true });
+socialScrapeSchema.index({ instagram: 1 }, { background: true, sparse: true });
+socialScrapeSchema.index({ linkedin: 1 }, { background: true, sparse: true });
+socialScrapeSchema.index({ pinterest: 1 }, { background: true, sparse: true });
+socialScrapeSchema.index({ youtube: 1 }, { background: true, sparse: true });
+
+// Unified multi-field text search index (for free-text fallback)
 socialScrapeSchema.index(
   {
     url: 'text', email: 'text', postcode: 'text',

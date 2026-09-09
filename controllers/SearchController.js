@@ -601,8 +601,13 @@ const searchSocialScrape = async (req, res) => {
             };
         } else if (type === 'email') {
             const cleanEmail = term.toLowerCase().trim();
-            // Use text index search — never unindexed field query on 85M docs (prevents 504 timeout)
-            query = { $text: { $search: `"${cleanEmail}"` } };
+            // Direct B-Tree index lookup — O(1) instantaneous scan, avoids 148s text token explosion on .co.uk
+            query = {
+                $or: [
+                    { email: cleanEmail },
+                    { email: { $gte: cleanEmail, $lt: cleanEmail + '\uffff' } }
+                ]
+            };
         } else if (type === 'social') {
             const cleanHandle = term
                 .replace(/^https?:\/\//i, '')
@@ -611,12 +616,32 @@ const searchSocialScrape = async (req, res) => {
                 .replace(/^@/, '')
                 .replace(/\/+$/, '')
                 .trim();
-            // Hits the unified text index across twitter, facebook, instagram, linkedin, pinterest, youtube
-            query = { $text: { $search: `"${cleanHandle || term}"` } };
+            const handle = cleanHandle || term;
+            // Cheap IXSCAN across individually indexed social fields
+            query = {
+                $or: [
+                    { twitter: handle },
+                    { facebook: handle },
+                    { instagram: handle },
+                    { linkedin: handle },
+                    { pinterest: handle },
+                    { youtube: handle },
+                    { twitter: { $gte: handle, $lt: handle + '\uffff' } },
+                    { facebook: { $gte: handle, $lt: handle + '\uffff' } },
+                    { instagram: { $gte: handle, $lt: handle + '\uffff' } },
+                    { linkedin: { $gte: handle, $lt: handle + '\uffff' } },
+                    { pinterest: { $gte: handle, $lt: handle + '\uffff' } },
+                    { youtube: { $gte: handle, $lt: handle + '\uffff' } }
+                ]
+            };
         } else if (type === 'postcode') {
             const normPc = normalizeSearchPostcode(term);
-            // Use text index search — never unindexed field query on 85M docs (prevents 504 timeout)
-            query = { $text: { $search: `"${normPc}"` } };
+            query = {
+                $or: [
+                    { postcode: normPc },
+                    { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                ]
+            };
         } else {
             // 'all': smart routing
             const digitCount = (term.match(/\d/g) || []).length;
@@ -632,8 +657,14 @@ const searchSocialScrape = async (req, res) => {
                     ]
                 };
             } else if (term.includes('@') && !term.includes(' ')) {
-                // Email format in 'all'
-                query = { $text: { $search: `"${term.toLowerCase().trim()}"` } };
+                // Email format in 'all' — use direct B-tree lookup
+                const cleanEmail = term.toLowerCase().trim();
+                query = {
+                    $or: [
+                        { email: cleanEmail },
+                        { email: { $gte: cleanEmail, $lt: cleanEmail + '\uffff' } }
+                    ]
+                };
             } else if (/^(https?:\/\/)?(www\.)?(twitter|x|facebook|instagram|linkedin|pinterest|youtube)\.com/i.test(term)) {
                 // Social profile URL in 'all'
                 const cleanHandle = term
@@ -643,9 +674,25 @@ const searchSocialScrape = async (req, res) => {
                     .replace(/^@/, '')
                     .replace(/\/+$/, '')
                     .trim();
-                query = { $text: { $search: `"${cleanHandle || term}"` } };
+                const handle = cleanHandle || term;
+                query = {
+                    $or: [
+                        { twitter: handle },
+                        { facebook: handle },
+                        { instagram: handle },
+                        { linkedin: handle },
+                        { pinterest: handle },
+                        { youtube: handle },
+                        { twitter: { $gte: handle, $lt: handle + '\uffff' } },
+                        { facebook: { $gte: handle, $lt: handle + '\uffff' } },
+                        { instagram: { $gte: handle, $lt: handle + '\uffff' } },
+                        { linkedin: { $gte: handle, $lt: handle + '\uffff' } },
+                        { pinterest: { $gte: handle, $lt: handle + '\uffff' } },
+                        { youtube: { $gte: handle, $lt: handle + '\uffff' } }
+                    ]
+                };
             } else {
-                // Standard text search across all 9 indexed fields
+                // Standard text search only as genuine fallback
                 query = { $text: { $search: term } };
             }
         }
