@@ -26,22 +26,7 @@ const MAX_TIME_MS  = 6000; // 6s timeout guard so queries never hang indefinitel
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function naturalCompare(a, b) {
-    const re = /(\d+)|(\D+)/g;
-    const pa = String(a || '').match(re) || [];
-    const pb = String(b || '').match(re) || [];
-    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-        if (pa[i] === undefined) return -1;
-        if (pb[i] === undefined) return 1;
-        const na = parseInt(pa[i], 10);
-        const nb = parseInt(pb[i], 10);
-        if (!isNaN(na) && !isNaN(nb)) {
-            if (na !== nb) return na - nb;
-        } else {
-            const cmp = pa[i].localeCompare(pb[i]);
-            if (cmp !== 0) return cmp;
-        }
-    }
-    return 0;
+    return String(a || '').localeCompare(String(b || ''), undefined, { numeric: true, sensitivity: 'base' });
 }
 
 /**
@@ -140,9 +125,13 @@ const searchRmAddress = async (req, res) => {
         const hasNextPage = cursorRows.length > lim;
         const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
 
-        // Natural sort client view
-        const sortKey = isPostcodeQuery ? 'postcode' : 'address';
-        const data = rows.sort((a, b) => naturalCompare(a[sortKey], b[sortKey]));
+        // Natural sort: postcode first, then address (numeric: Cottage 1, Cottage 2, Cottage 10)
+        const data = rows.sort((a, b) => {
+            if (a.postcode !== b.postcode) {
+                return naturalCompare(a.postcode, b.postcode);
+            }
+            return naturalCompare(a.address, b.address);
+        });
 
         const lastRow = rows[rows.length - 1] || null;
         const nextCursor = hasNextPage && lastRow
@@ -232,7 +221,12 @@ const searchPropPrice = async (req, res) => {
         const hasNextPage = cursorRows.length > lim;
         const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
 
-        const data = rows.sort((a, b) => naturalCompare(a.address_display, b.address_display));
+        const data = rows.sort((a, b) => {
+            if (a.postcode !== b.postcode) {
+                return naturalCompare(a.postcode, b.postcode);
+            }
+            return naturalCompare(a.address_display, b.address_display);
+        });
 
         const lastRow = rows[rows.length - 1] || null;
         const nextCursor = hasNextPage && lastRow
