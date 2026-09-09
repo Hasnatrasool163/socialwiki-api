@@ -439,36 +439,66 @@ const searchScreenshot = async (req, res) => {
         const lim = Math.min(parseInt(limit, 10) || SEARCH_LIMIT, SEARCH_LIMIT);
 
         // Normalize URL queries (support bare domains, with or without http/https/www)
-        const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '');
-        const variants = [
+        const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').trim();
+        const cleanLower = clean.toLowerCase();
+
+        // Exact candidates list for instant O(1) index lookup across all common URL variants
+        const candidates = [
             term,
+            term.toLowerCase(),
             clean,
+            cleanLower,
             `http://${clean}`,
+            `http://${cleanLower}`,
             `https://${clean}`,
+            `https://${cleanLower}`,
             `http://www.${clean}`,
+            `http://www.${cleanLower}`,
             `https://www.${clean}`,
+            `https://www.${cleanLower}`,
+            `http://${clean}/`,
+            `http://${cleanLower}/`,
+            `https://${clean}/`,
+            `https://${cleanLower}/`,
+            `http://www.${clean}/`,
+            `http://www.${cleanLower}/`,
+            `https://www.${clean}/`,
+            `https://www.${cleanLower}/`,
         ];
+        const variants = [...new Set(candidates)];
 
-        const escaped = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-        let query = {
-            $or: [
-                { url: { $in: variants } },
-                { url: { $regex: `^https?://(www\\.)?${escaped}`, $options: 'i' } },
-                { url: { $regex: `^${escaped}`, $options: 'i' } }
-            ]
-        };
+        // 1. First attempt instant index point lookup with variants
+        let query = { url: { $in: variants } };
 
         if (cursor && mongoose.isValidObjectId(cursor)) {
             query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
         }
 
-        const cursorRows = await ScreenshotUrl
+        let cursorRows = await ScreenshotUrl
             .find(query, { url: 1, image: 1, _id: 1 })
-            .sort({ url: 1, _id: 1 })
+            .sort({ url: 1, image: 1 })
             .limit(lim + 1)
             .maxTimeMS(MAX_TIME_MS)
             .lean();
+
+        // 2. If no exact match and query is a prefix/partial search (e.g. "043" or "b-m"),
+        // perform pure B-Tree index range scans (NEVER case-insensitive regex)
+        if (cursorRows.length === 0 && !cursor) {
+            const prefixConditions = [
+                { url: { $gte: `http://${cleanLower}`, $lt: `http://${cleanLower}\uffff` } },
+                { url: { $gte: `https://${cleanLower}`, $lt: `https://${cleanLower}\uffff` } },
+                { url: { $gte: `http://www.${cleanLower}`, $lt: `http://www.${cleanLower}\uffff` } },
+                { url: { $gte: `https://www.${cleanLower}`, $lt: `https://www.${cleanLower}\uffff` } },
+                { url: { $gte: cleanLower, $lt: `${cleanLower}\uffff` } },
+            ];
+
+            cursorRows = await ScreenshotUrl
+                .find({ $or: prefixConditions }, { url: 1, image: 1, _id: 1 })
+                .sort({ url: 1, image: 1 })
+                .limit(lim + 1)
+                .maxTimeMS(MAX_TIME_MS)
+                .lean();
+        }
 
         const hasNextPage = cursorRows.length > lim;
         const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
