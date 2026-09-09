@@ -19,6 +19,7 @@ const rmAddressEditRoutes = require('./routes/rmAddressEditRoutes');
 const rmAddressAiRoutes = require('./routes/rmAddressAiRoutes');
 const rmAddressPrecheckRoutes = require('./routes/rmAddressPrecheckRoutes');
 const rmAddressCheckedRoutes = require('./routes/rmAddressCheckedRoutes');
+const searchRoutes = require('./routes/searchRoutes');
 
 const app = express();
 
@@ -27,7 +28,15 @@ app.use(express.json({ limit: '50mb' })); // Increased limit for large requests
 
 // CORS configuration - Move this before other middleware
 const corsOptions = {
-    origin: ['http://localhost:5173', 'http://localhost:5174', 'https://admin.socialwiki.co.uk', 'https://admin.postalwiki.co.uk', 'https://api.postalwiki.co.uk'],
+    origin: [
+        'http://localhost:5173',
+        'http://localhost:5174',
+        'https://socialwiki.co.uk',
+        'https://www.socialwiki.co.uk',
+        'https://admin.socialwiki.co.uk',
+        'https://admin.postalwiki.co.uk',
+        'https://api.postalwiki.co.uk',
+    ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
     exposedHeaders: ['Content-Range', 'X-Content-Range'],
@@ -100,7 +109,11 @@ app.use('/api/rm-address/edit', verifyToken, authorizeRoles('admin'), rmAddressE
 app.use('/api/rm-address/ai', rmAddressAiRoutes);
 app.use('/api/rm-address/precheck', rmAddressPrecheckRoutes);
 app.use('/api/rm-address/checked', rmAddressCheckedRoutes);
-app.use('/api/rm-address', rmAddressRoutes); 
+app.use('/api/rm-address', rmAddressRoutes);
+
+// Public search routes (JWT-authenticated, rate-limited — guards inside searchRoutes)
+app.use('/api/search', searchRoutes);
+
 
 app.get('/admin', verifyToken, authorizeRoles('admin'), (req, res) => {
     res.json({ message: 'Welcome admin!' });

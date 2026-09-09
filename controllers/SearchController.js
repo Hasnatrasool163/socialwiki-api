@@ -1,0 +1,413 @@
+/**
+ * SearchController.js
+ *
+ * Optimized high-performance handlers for the public search API.
+ * Uses index-aligned prefix range scans ($gte / $lt: \uffff) on 36M+ doc collections
+ * matching the composite indexes, preventing catastrophic full collection scans.
+ *
+ * Natural sort is applied in-memory on the returned page (up to 50 docs).
+ */
+
+const mongoose = require('mongoose');
+
+// Models
+const AddressMasterMerged = require('../models/AddressMasterMerged');
+const PropPrice           = require('../models/PropPrice');
+const ChData = mongoose.models.ChData ||
+    mongoose.model('ChData', new mongoose.Schema({}, {
+        strict: false,
+        collection: 'ch_data',
+        versionKey: false,
+    }));
+
+const SEARCH_LIMIT = 50;
+const MAX_TIME_MS  = 6000; // 6s timeout guard so queries never hang indefinitely
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function naturalCompare(a, b) {
+    const re = /(\d+)|(\D+)/g;
+    const pa = String(a || '').match(re) || [];
+    const pb = String(b || '').match(re) || [];
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        if (pa[i] === undefined) return -1;
+        if (pb[i] === undefined) return 1;
+        const na = parseInt(pa[i], 10);
+        const nb = parseInt(pb[i], 10);
+        if (!isNaN(na) && !isNaN(nb)) {
+            if (na !== nb) return na - nb;
+        } else {
+            const cmp = pa[i].localeCompare(pb[i]);
+            if (cmp !== 0) return cmp;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Normalizes UK postcode to uppercase with standardized spacing
+ */
+function normalizeSearchPostcode(value) {
+    if (!value) return '';
+    let clean = value.toString().trim().toUpperCase().replace(/[^A-Z0-9 ]/g, '').replace(/\s+/g, ' ');
+    if (!clean) return '';
+    const continuousText = clean.replace(/\s/g, '');
+    const fullPostcodeNoSpaceRegex = /^([A-Z]{1,2}[0-9][A-Z0-9]?)([0-9][A-Z]{2})$/;
+    if (fullPostcodeNoSpaceRegex.test(continuousText)) {
+        return continuousText.replace(fullPostcodeNoSpaceRegex, '$1 $2');
+    }
+    return clean;
+}
+
+function encodeCursorToken(payload) {
+    return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+}
+
+function decodeCursorToken(cursor) {
+    if (!cursor) return null;
+    try {
+        const decoded = JSON.parse(Buffer.from(String(cursor), 'base64').toString('utf8'));
+        if (!decoded || typeof decoded !== 'object') return null;
+        return decoded;
+    } catch {
+        return null;
+    }
+}
+
+function usageBlock(req) {
+    return req.searchUsage || null;
+}
+
+// ── 1. RM Address search (address_master_merged: 36M+ docs) ────────────────
+
+const searchRmAddress = async (req, res) => {
+    try {
+        const { q = '', type = 'postcode', cursor, limit } = req.query;
+        const term = q.trim();
+        if (!term || term.length < 2) {
+            return res.status(400).json({ success: false, message: 'Query must be at least 2 characters.' });
+        }
+
+        const lim = Math.min(parseInt(limit, 10) || SEARCH_LIMIT, SEARCH_LIMIT);
+
+        let query = {};
+        let sortStage = { _id: 1 };
+        let isPostcodeQuery = (type === 'postcode');
+
+        if (isPostcodeQuery) {
+            const normalized = normalizeSearchPostcode(term);
+            const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
+
+            if (fullPostcodeRegex.test(normalized)) {
+                query.postcode = normalized;
+            } else {
+                // B-Tree prefix range query: hits postcode_1__id_1 index directly!
+                query.postcode = { $gte: normalized, $lt: `${normalized}\uffff` };
+            }
+
+            sortStage = { postcode: 1, _id: 1 };
+
+            // Keyset cursor pagination
+            if (cursor) {
+                const cursorData = decodeCursorToken(cursor);
+                if (cursorData?.postcode && cursorData?._id) {
+                    query.$or = [
+                        { postcode: { $gt: cursorData.postcode } },
+                        { postcode: cursorData.postcode, _id: { $gt: new mongoose.Types.ObjectId(cursorData._id) } }
+                    ];
+                } else if (mongoose.isValidObjectId(cursor)) {
+                    query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+                }
+            }
+        } else {
+            // Partial address search
+            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            query.address = { $regex: escaped, $options: 'i' };
+
+            if (cursor && mongoose.isValidObjectId(cursor)) {
+                query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+            }
+            sortStage = { _id: 1 };
+        }
+
+        const cursorRows = await AddressMasterMerged
+            .find(query, { postcode: 1, district: 1, address: 1, _id: 1 })
+            .sort(sortStage)
+            .limit(lim + 1)
+            .maxTimeMS(MAX_TIME_MS)
+            .lean();
+
+        const hasNextPage = cursorRows.length > lim;
+        const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
+
+        // Natural sort client view
+        const sortKey = isPostcodeQuery ? 'postcode' : 'address';
+        const data = rows.sort((a, b) => naturalCompare(a[sortKey], b[sortKey]));
+
+        const lastRow = rows[rows.length - 1] || null;
+        const nextCursor = hasNextPage && lastRow
+            ? (isPostcodeQuery
+                ? encodeCursorToken({ postcode: lastRow.postcode, _id: String(lastRow._id) })
+                : String(lastRow._id))
+            : null;
+
+        return res.json({
+            success: true,
+            db: 'rm_address',
+            count: data.length,
+            data: data.map(d => ({ postcode: d.postcode, district: d.district, address: d.address })),
+            cursor: nextCursor,
+            usage: usageBlock(req),
+        });
+    } catch (err) {
+        console.error('[searchRmAddress]', err.message);
+        if (err.name === 'MongooseError' && err.message.includes('buffering timed out')) {
+            return res.status(504).json({ success: false, error: 'Query timed out. Please refine your search.' });
+        }
+        return res.status(500).json({ success: false, error: err.message });
+    }
+};
+
+// ── 2. Property Price search (prop_price: 31M+ docs) ───────────────────────
+
+const searchPropPrice = async (req, res) => {
+    try {
+        const { q = '', type = 'postcode', cursor, limit } = req.query;
+        const term = q.trim();
+        if (!term || term.length < 2) {
+            return res.status(400).json({ success: false, message: 'Query must be at least 2 characters.' });
+        }
+
+        const lim = Math.min(parseInt(limit, 10) || SEARCH_LIMIT, SEARCH_LIMIT);
+
+        let query = {};
+        let sortStage = { _id: 1 };
+        const isPostcodeQuery = (type === 'postcode');
+
+        if (isPostcodeQuery) {
+            const normalized = normalizeSearchPostcode(term);
+            const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
+
+            if (fullPostcodeRegex.test(normalized)) {
+                query.postcode = normalized;
+            } else {
+                query.postcode = { $gte: normalized, $lt: `${normalized}\uffff` };
+            }
+
+            // Matches compound index { postcode: 1, deed_date: -1 }
+            sortStage = { postcode: 1, deed_date: -1, _id: 1 };
+
+            if (cursor) {
+                const cursorData = decodeCursorToken(cursor);
+                if (cursorData?.postcode && cursorData?._id) {
+                    query.$or = [
+                        { postcode: { $gt: cursorData.postcode } },
+                        { postcode: cursorData.postcode, _id: { $gt: new mongoose.Types.ObjectId(cursorData._id) } }
+                    ];
+                } else if (mongoose.isValidObjectId(cursor)) {
+                    query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+                }
+            }
+        } else {
+            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            query.address_display = { $regex: escaped, $options: 'i' };
+
+            if (cursor && mongoose.isValidObjectId(cursor)) {
+                query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+            }
+            sortStage = { _id: 1 };
+        }
+
+        const cursorRows = await PropPrice
+            .find(query, {
+                address_display: 1, postcode: 1, price_paid: 1,
+                deed_date: 1, property_type: 1, new_build: 1,
+                town: 1, district: 1, county: 1, _id: 1,
+            })
+            .sort(sortStage)
+            .limit(lim + 1)
+            .maxTimeMS(MAX_TIME_MS)
+            .lean();
+
+        const hasNextPage = cursorRows.length > lim;
+        const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
+
+        const data = rows.sort((a, b) => naturalCompare(a.address_display, b.address_display));
+
+        const lastRow = rows[rows.length - 1] || null;
+        const nextCursor = hasNextPage && lastRow
+            ? (isPostcodeQuery
+                ? encodeCursorToken({ postcode: lastRow.postcode, _id: String(lastRow._id) })
+                : String(lastRow._id))
+            : null;
+
+        return res.json({
+            success: true,
+            db: 'prop_price',
+            count: data.length,
+            data: data.map(d => ({
+                address:       d.address_display,
+                postcode:      d.postcode,
+                price:         d.price_paid,
+                date:          d.deed_date ? new Date(d.deed_date).toLocaleDateString('en-GB') : null,
+                property_type: d.property_type,
+                new_build:     d.new_build,
+                town:          d.town,
+                district:      d.district,
+                county:        d.county,
+            })),
+            cursor: nextCursor,
+            usage: usageBlock(req),
+        });
+    } catch (err) {
+        console.error('[searchPropPrice]', err.message);
+        return res.status(500).json({ success: false, error: err.message });
+    }
+};
+
+// ── 3. Companies House (ch_data: 5.6M+ docs) ───────────────────────────────
+
+const searchCompany = async (req, res) => {
+    try {
+        const { q = '', type = 'name', cursor, limit } = req.query;
+        const term = q.trim();
+        if (!term || term.length < 2) {
+            return res.status(400).json({ success: false, message: 'Query must be at least 2 characters.' });
+        }
+
+        const lim = Math.min(parseInt(limit, 10) || SEARCH_LIMIT, SEARCH_LIMIT);
+
+        let query = {};
+        let sortStage = { _id: 1 };
+        const isPostcodeQuery = (type === 'postcode');
+
+        if (isPostcodeQuery) {
+            const normalized = normalizeSearchPostcode(term);
+            const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
+
+            if (fullPostcodeRegex.test(normalized)) {
+                query['RegAddress.PostCode'] = normalized;
+            } else {
+                query['RegAddress.PostCode'] = { $gte: normalized, $lt: `${normalized}\uffff` };
+            }
+
+            sortStage = { 'RegAddress.PostCode': 1, _id: 1 };
+
+            if (cursor && mongoose.isValidObjectId(cursor)) {
+                query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+            }
+        } else {
+            // Check if text search is ready
+            try {
+                const textQuery = { $text: { $search: term } };
+                if (cursor && mongoose.isValidObjectId(cursor)) {
+                    textQuery._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+                }
+
+                const cursorRows = await ChData
+                    .find(textQuery, {
+                        CompanyName: 1, CompanyNumber: 1,
+                        'RegAddress.AddressLine1': 1, 'RegAddress.PostTown': 1,
+                        'RegAddress.PostCode': 1, CompanyStatus: 1,
+                        IncorporationDate: 1, _id: 1,
+                        score: { $meta: 'textScore' },
+                    })
+                    .sort({ score: { $meta: 'textScore' }, _id: 1 })
+                    .limit(lim + 1)
+                    .maxTimeMS(MAX_TIME_MS)
+                    .lean();
+
+                const hasNextPage = cursorRows.length > lim;
+                const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
+                const data = rows.sort((a, b) => naturalCompare(a.CompanyName, b.CompanyName));
+                const nextCursor = hasNextPage && rows[rows.length - 1] ? String(rows[rows.length - 1]._id) : null;
+
+                return res.json({
+                    success: true,
+                    db: 'ch_data',
+                    count: data.length,
+                    data: data.map(formatCompany),
+                    cursor: nextCursor,
+                    usage: usageBlock(req),
+                });
+            } catch (textErr) {
+                // Text index fallback: prefix match with anchored regex if text index is not yet built
+                const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                query = { CompanyName: { $regex: `^${escaped}`, $options: 'i' } };
+                if (cursor && mongoose.isValidObjectId(cursor)) {
+                    query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+                }
+                sortStage = { _id: 1 };
+            }
+        }
+
+        const cursorRows = await ChData
+            .find(query, {
+                CompanyName: 1, CompanyNumber: 1,
+                'RegAddress.AddressLine1': 1, 'RegAddress.PostTown': 1,
+                'RegAddress.PostCode': 1, CompanyStatus: 1,
+                IncorporationDate: 1, _id: 1,
+            })
+            .sort(sortStage)
+            .limit(lim + 1)
+            .maxTimeMS(MAX_TIME_MS)
+            .lean();
+
+        const hasNextPage = cursorRows.length > lim;
+        const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
+        const data = rows.sort((a, b) => naturalCompare(a.CompanyName, b.CompanyName));
+        const nextCursor = hasNextPage && rows[rows.length - 1] ? String(rows[rows.length - 1]._id) : null;
+
+        return res.json({
+            success: true,
+            db: 'ch_data',
+            count: data.length,
+            data: data.map(formatCompany),
+            cursor: nextCursor,
+            usage: usageBlock(req),
+        });
+    } catch (err) {
+        console.error('[searchCompany]', err.message);
+        return res.status(500).json({ success: false, error: err.message });
+    }
+};
+
+function formatCompany(d) {
+    return {
+        name:         d.CompanyName,
+        number:       d.CompanyNumber,
+        address:      [d['RegAddress.AddressLine1'], d['RegAddress.PostTown'], d['RegAddress.PostCode']]
+                         .filter(Boolean).join(', '),
+        status:       d.CompanyStatus,
+        incorporated: d.IncorporationDate,
+    };
+}
+
+// ── 4. Usage stats ─────────────────────────────────────────────────────────
+
+const getUsage = async (req, res) => {
+    try {
+        const User = require('../models/User');
+        const user = await User.findById(req.user.id).select('plan searchCount searchResetDate').lean();
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+        const FREE_DAILY_LIMIT = parseInt(process.env.FREE_DAILY_LIMIT || '50', 10);
+        const limit = user.plan === 'paid' || user.plan === 'admin' ? null : FREE_DAILY_LIMIT;
+
+        const midnight = new Date();
+        midnight.setUTCHours(24, 0, 0, 0);
+
+        return res.json({
+            success: true,
+            plan:      user.plan,
+            used:      user.searchCount || 0,
+            limit,
+            remaining: limit === null ? null : Math.max(0, limit - (user.searchCount || 0)),
+            resetAt:   midnight.toISOString(),
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+};
+
+module.exports = { searchRmAddress, searchPropPrice, searchCompany, getUsage };

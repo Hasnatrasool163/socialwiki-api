@@ -10,16 +10,24 @@ exports.register = async (req, res) => {
     try {
         const validated = registerSchema.parse(req.body);
         const existingUser = await User.findOne({ username: validated.username });
-        if (existingUser) return res.status(400).json({ message: 'Username already exists' });
+        if (existingUser) return res.status(400).json({ message: 'An account with this email already exists.' });
 
         const hashedPassword = await bcrypt.hash(validated.password, 10);
         const user = new User({
-            username: validated.username,
-            password: hashedPassword,
-            role: ROLES.USER,
+            username:        validated.username,
+            password:        hashedPassword,
+            role:            ROLES.USER,
+            plan:            'pending',   // requires manual approval before searching
+            searchCount:     0,
+            searchResetDate: new Date(),
         });
         await user.save();
-        res.status(201).json({ message: 'User registered successfully' });
+
+        // Return pending status — frontend shows the "access coming soon" screen
+        res.status(201).json({
+            pending: true,
+            message: 'Request received. Your account is pending approval.',
+        });
     } catch (err) {
         if (err.name === 'ZodError') {
             return res.status(400).json({ errors: err.errors });
@@ -40,18 +48,29 @@ exports.login = async (req, res) => {
         
         if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
+        const FREE_DAILY_LIMIT = parseInt(process.env.FREE_DAILY_LIMIT || '50', 10);
+        const midnight = new Date(); midnight.setUTCHours(24, 0, 0, 0);
+        const limit     = (user.plan === 'paid' || user.plan === 'admin') ? null : FREE_DAILY_LIMIT;
+        const remaining = limit === null ? null : Math.max(0, limit - (user.searchCount || 0));
+
         const token = jwt.sign(
             { id: user?._id, role: user?.role },
             process.env.JWT_SECRET,
             { expiresIn: '1d' }
         );
         res.json({
-            token, user: {
-                id: user._id,
-                username: user.username,
-                role: user.role,
-                email: user.username,
-            }
+            token,
+            user: {
+                id:        user._id,
+                username:  user.username,
+                role:      user.role,
+                email:     user.username,
+                plan:      user.plan      || 'free',
+                used:      user.searchCount || 0,
+                limit,
+                remaining,
+                resetAt:   midnight.toISOString(),
+            },
         });
     } catch (err) {
         if (err.name === 'ZodError') {

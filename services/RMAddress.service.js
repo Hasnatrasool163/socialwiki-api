@@ -270,7 +270,7 @@ const importFromCsv = async ({ filePath }) => {
             continue;
         }
 
-        const addressCanonical = JSON.stringify(standardized);
+        const addressCanonical = serializeAddress(standardized);
         const dateCreated = record.dateCreated || getDateCreated();
 
         batch.push({
@@ -306,7 +306,7 @@ const importFromCsv = async ({ filePath }) => {
 const updateRecord = async (id, data) => {
     const update = { ...data };
     if (update.postcode) update.postcode = normalizePostcode(update.postcode);
-    if (update.address && Array.isArray(update.address)) update.address = JSON.stringify(update.address);
+    if (update.address !== undefined) update.address = serializeAddress(update.address);
 
     const result = await AddressMasterMerged.updateOne({ _id: id }, { $set: update });
     return result;
@@ -324,7 +324,7 @@ const bulkApplyEdits = async (edits) => {
         const update = { $set: {} };
         if (e.postcode) update.$set.postcode = normalizePostcode(e.postcode);
         if (e.district) update.$set.district = e.district;
-        if (e.address) update.$set.address = typeof e.address === 'string' ? e.address : JSON.stringify(e.address);
+        if (e.address !== undefined) update.$set.address = serializeAddress(e.address);
         if (Object.keys(update.$set).length === 0) continue;
 
         ops.push({ updateOne: { filter, update, upsert: false } });
@@ -422,6 +422,19 @@ const outwardCode = (postcode) => {
 const cleanPart = (value) => {
     if (!value) return '';
     return value.toString().replace(/[\u0000-\u001F\u007F-\u009F]/g, '').trim();
+};
+
+const serializeAddress = (value) => {
+    if (Array.isArray(value)) {
+        return value
+            .map((part) => cleanPart(part))
+            .filter(Boolean)
+            .join(', ');
+    }
+
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value.trim();
+    return String(value).trim();
 };
 
 const getAddressParts = (record) => {
@@ -569,7 +582,7 @@ const processFile = async (filePath) => {
         batch.push({
             postcode,
             district,
-            address: JSON.stringify(addressParts),
+            address: addressParts.join(', '),
             dateCreated: getDateCreated(),
             correctionVersion: 'v1',
             exceptionVersion: undefined
