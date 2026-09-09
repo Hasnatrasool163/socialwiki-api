@@ -603,12 +603,22 @@ const searchSocialScrape = async (req, res) => {
             const cleanEmail = term.toLowerCase().trim();
             // Use text index search — never unindexed field query on 85M docs (prevents 504 timeout)
             query = { $text: { $search: `"${cleanEmail}"` } };
+        } else if (type === 'social') {
+            const cleanHandle = term
+                .replace(/^https?:\/\//i, '')
+                .replace(/^www\./i, '')
+                .replace(/^(twitter|x|facebook|instagram|linkedin|pinterest|youtube)\.com\/?(in\/|user\/|company\/)?/i, '')
+                .replace(/^@/, '')
+                .replace(/\/+$/, '')
+                .trim();
+            // Hits the unified text index across twitter, facebook, instagram, linkedin, pinterest, youtube
+            query = { $text: { $search: `"${cleanHandle || term}"` } };
         } else if (type === 'postcode') {
             const normPc = normalizeSearchPostcode(term);
             // Use text index search — never unindexed field query on 85M docs (prevents 504 timeout)
             query = { $text: { $search: `"${normPc}"` } };
         } else {
-            // 'all': check if query looks like a phone number (e.g. 03707555088, +44..., digits)
+            // 'all': smart routing
             const digitCount = (term.match(/\d/g) || []).length;
             const isLikelyPhone = digitCount >= 7 && /^[\d\s+()-]+$/.test(term);
 
@@ -621,8 +631,21 @@ const searchSocialScrape = async (req, res) => {
                         { 'phone.number': { $gte: cleanPhone, $lt: cleanPhone + '\uffff' } }
                     ]
                 };
+            } else if (term.includes('@') && !term.includes(' ')) {
+                // Email format in 'all'
+                query = { $text: { $search: `"${term.toLowerCase().trim()}"` } };
+            } else if (/^(https?:\/\/)?(www\.)?(twitter|x|facebook|instagram|linkedin|pinterest|youtube)\.com/i.test(term)) {
+                // Social profile URL in 'all'
+                const cleanHandle = term
+                    .replace(/^https?:\/\//i, '')
+                    .replace(/^www\./i, '')
+                    .replace(/^(twitter|x|facebook|instagram|linkedin|pinterest|youtube)\.com\/?(in\/|user\/|company\/)?/i, '')
+                    .replace(/^@/, '')
+                    .replace(/\/+$/, '')
+                    .trim();
+                query = { $text: { $search: `"${cleanHandle || term}"` } };
             } else {
-                // standard text search across url, email, postcode, social handles
+                // Standard text search across all 9 indexed fields
                 query = { $text: { $search: term } };
             }
         }
