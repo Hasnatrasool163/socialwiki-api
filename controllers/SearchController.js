@@ -14,6 +14,7 @@ const mongoose = require('mongoose');
 const AddressMasterMerged = require('../models/AddressMasterMerged');
 const PropPrice           = require('../models/PropPrice');
 const ScreenshotUrl       = require('../models/ScreenshotUrl');
+const SocialScrape        = require('../models/SocialScrape');
 const ChData = mongoose.models.ChData ||
     mongoose.model('ChData', new mongoose.Schema({}, {
         strict: false,
@@ -508,7 +509,145 @@ const searchScreenshot = async (req, res) => {
     }
 };
 
-// ── 5. Usage stats ─────────────────────────────────────────────────────────
+function formatSocialScrape(d) {
+    let phones = [];
+    if (Array.isArray(d.phone)) {
+        phones = d.phone.map(p => {
+            if (typeof p === 'object' && p !== null) {
+                return p.number ? (p.areaName ? `${p.number} (${p.areaName})` : p.number) : null;
+            }
+            return String(p || '');
+        }).filter(Boolean);
+    } else if (d.phone) {
+        phones = [String(d.phone)];
+    }
+
+    return {
+        _id: d._id,
+        url: d.url,
+        date: d.date,
+        email: d.email || null,
+        postcode: d.postcode || null,
+        phone: phones,
+        twitter: d.twitter || null,
+        facebook: d.facebook || null,
+        instagram: d.instagram || null,
+        linkedin: d.linkedin || null,
+        pinterest: d.pinterest || null,
+        youtube: d.youtube || null,
+    };
+}
+
+// ── 5. Social Scrapes search (socialscrapes: 85M docs) ─────────────────────
+
+const searchSocialScrape = async (req, res) => {
+    try {
+        const { q = '', type = 'all', cursor, limit } = req.query;
+        const term = q.trim();
+        if (!term || term.length < 2) {
+            return res.status(400).json({ success: false, message: 'Query must be at least 2 characters.' });
+        }
+
+        const lim = Math.min(parseInt(limit, 10) || SEARCH_LIMIT, SEARCH_LIMIT);
+        let query = {};
+
+        if (type === 'url') {
+            const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '');
+            query = {
+                $or: [
+                    { url: clean },
+                    { url: term },
+                    { url: { $gte: clean, $lt: clean + '\uffff' } }
+                ]
+            };
+        } else if (type === 'phone') {
+            const cleanPhone = term.replace(/[^0-9+]/g, '');
+            query = {
+                $or: [
+                    { 'phone.number': cleanPhone },
+                    { 'phone.number': term },
+                    { 'phone.number': { $gte: cleanPhone, $lt: cleanPhone + '\uffff' } }
+                ]
+            };
+        } else if (type === 'email') {
+            const cleanEmail = term.toLowerCase();
+            query = {
+                $or: [
+                    { email: cleanEmail },
+                    { email: { $gte: cleanEmail, $lt: cleanEmail + '\uffff' } }
+                ]
+            };
+        } else if (type === 'postcode') {
+            const normPc = normalizeSearchPostcode(term);
+            query = {
+                $or: [
+                    { postcode: normPc },
+                    { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                ]
+            };
+        } else {
+            // 'all': use text index search across all indexed fields
+            query = { $text: { $search: term } };
+        }
+
+        if (cursor && mongoose.isValidObjectId(cursor)) {
+            query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+        }
+
+        const projection = {
+            url: 1,
+            date: 1,
+            email: 1,
+            postcode: 1,
+            phone: 1,
+            twitter: 1,
+            facebook: 1,
+            instagram: 1,
+            linkedin: 1,
+            pinterest: 1,
+            youtube: 1,
+            _id: 1
+        };
+
+        const cursorRows = await SocialScrape
+            .find(query, projection)
+            .sort({ _id: 1 })
+            .limit(lim + 1)
+            .maxTimeMS(MAX_TIME_MS)
+            .lean();
+
+        const hasNextPage = cursorRows.length > lim;
+        const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
+        const data = rows.map(formatSocialScrape);
+        const nextCursor = hasNextPage && rows[rows.length - 1] ? String(rows[rows.length - 1]._id) : null;
+
+        return res.json({
+            success: true,
+            db: 'socialscrapes',
+            count: data.length,
+            data,
+            cursor: nextCursor,
+            usage: usageBlock(req),
+        });
+    } catch (err) {
+        console.error('[searchSocialScrape]', err.message);
+        if (err.message && (err.message.includes('text index required') || err.message.includes('no text index'))) {
+            return res.status(400).json({
+                success: false,
+                error: 'Unified text search index is currently building or missing. Please search by URL, Phone, or Postcode.',
+            });
+        }
+        if (err.message && (err.message.includes('exceeded time limit') || err.message.includes('buffering timed out'))) {
+            return res.status(504).json({
+                success: false,
+                error: 'Search timed out. Try refining your search query.',
+            });
+        }
+        return res.status(500).json({ success: false, error: err.message });
+    }
+};
+
+// ── 6. Usage stats ─────────────────────────────────────────────────────────
 
 const getUsage = async (req, res) => {
     try {
@@ -535,4 +674,11 @@ const getUsage = async (req, res) => {
     }
 };
 
-module.exports = { searchRmAddress, searchPropPrice, searchCompany, searchScreenshot, getUsage };
+module.exports = {
+    searchRmAddress,
+    searchPropPrice,
+    searchCompany,
+    searchScreenshot,
+    searchSocialScrape,
+    getUsage
+};

@@ -15,6 +15,7 @@ const {
     searchPropPrice,
     searchCompany,
     searchScreenshot,
+    searchSocialScrape,
     getUsage,
 } = require('../controllers/SearchController');
 
@@ -26,6 +27,7 @@ router.get('/rm-address', ...guard, searchRmAddress);
 router.get('/prop-price', ...guard, searchPropPrice);
 router.get('/company',    ...guard, searchCompany);
 router.get('/screenshot', ...guard, searchScreenshot);
+router.get('/social',     ...guard, searchSocialScrape);
 
 // Usage stats — no rate-limit hit, just needs auth
 router.get('/usage', verifyToken, getUsage);
