@@ -21,7 +21,7 @@ const ChData = mongoose.models.ChData ||
     }));
 
 const SEARCH_LIMIT = 50;
-const MAX_TIME_MS  = 6000; // 6s timeout guard so queries never hang indefinitely
+const MAX_TIME_MS  = 10000; // 10s timeout guard
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -105,14 +105,46 @@ const searchRmAddress = async (req, res) => {
                 }
             }
         } else {
-            // Partial address search
-            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            query.address = { $regex: escaped, $options: 'i' };
+            // Try full-text search on address if text index exists
+            try {
+                const textQuery = { $text: { $search: term } };
+                if (cursor && mongoose.isValidObjectId(cursor)) {
+                    textQuery._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+                }
 
-            if (cursor && mongoose.isValidObjectId(cursor)) {
-                query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+                const cursorRows = await AddressMasterMerged
+                    .find(textQuery, {
+                        postcode: 1, district: 1, address: 1, _id: 1,
+                        score: { $meta: 'textScore' }
+                    })
+                    .sort({ score: { $meta: 'textScore' }, _id: 1 })
+                    .limit(lim + 1)
+                    .maxTimeMS(MAX_TIME_MS)
+                    .lean();
+
+                const hasNextPage = cursorRows.length > lim;
+                const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
+                const data = rows.sort((a, b) => naturalCompare(a.address, b.address));
+                const nextCursor = hasNextPage && rows[rows.length - 1] ? String(rows[rows.length - 1]._id) : null;
+
+                return res.json({
+                    success: true,
+                    db: 'rm_address',
+                    count: data.length,
+                    data: data.map(d => ({ postcode: d.postcode, district: d.district, address: d.address })),
+                    cursor: nextCursor,
+                    usage: usageBlock(req),
+                });
+            } catch (textErr) {
+                // Text index not present — fall back to regex scan
+                const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                query.address = { $regex: escaped, $options: 'i' };
+
+                if (cursor && mongoose.isValidObjectId(cursor)) {
+                    query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+                }
+                sortStage = { _id: 1 };
             }
-            sortStage = { _id: 1 };
         }
 
         const cursorRows = await AddressMasterMerged
@@ -150,8 +182,11 @@ const searchRmAddress = async (req, res) => {
         });
     } catch (err) {
         console.error('[searchRmAddress]', err.message);
-        if (err.name === 'MongooseError' && err.message.includes('buffering timed out')) {
-            return res.status(504).json({ success: false, error: 'Query timed out. Please refine your search.' });
+        if (err.message && (err.message.includes('exceeded time limit') || err.message.includes('buffering timed out'))) {
+            return res.status(504).json({
+                success: false,
+                error: 'Search timed out. Searching by Postcode is instant, or include a postcode prefix (e.g. "W1", "DD9").',
+            });
         }
         return res.status(500).json({ success: false, error: err.message });
     }
@@ -255,6 +290,12 @@ const searchPropPrice = async (req, res) => {
         });
     } catch (err) {
         console.error('[searchPropPrice]', err.message);
+        if (err.message && (err.message.includes('exceeded time limit') || err.message.includes('buffering timed out'))) {
+            return res.status(504).json({
+                success: false,
+                error: 'Search timed out. Searching by Postcode is instant, or include a postcode prefix.',
+            });
+        }
         return res.status(500).json({ success: false, error: err.message });
     }
 };
@@ -362,6 +403,12 @@ const searchCompany = async (req, res) => {
         });
     } catch (err) {
         console.error('[searchCompany]', err.message);
+        if (err.message && (err.message.includes('exceeded time limit') || err.message.includes('buffering timed out'))) {
+            return res.status(504).json({
+                success: false,
+                error: 'Search timed out. Try searching by Postcode or refine the company name.',
+            });
+        }
         return res.status(500).json({ success: false, error: err.message });
     }
 };
