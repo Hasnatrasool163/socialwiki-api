@@ -609,29 +609,35 @@ const searchSocialScrape = async (req, res) => {
                 ]
             };
         } else if (type === 'social') {
-            const cleanHandle = term
-                .replace(/^https?:\/\//i, '')
-                .replace(/^www\./i, '')
+            const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').trim();
+            const cleanHandle = clean
                 .replace(/^(twitter|x|facebook|instagram|linkedin|pinterest|youtube)\.com\/?(in\/|user\/|company\/)?/i, '')
                 .replace(/^@/, '')
-                .replace(/\/+$/, '')
                 .trim();
-            const handle = cleanHandle || term;
-            // Cheap IXSCAN across individually indexed social fields
+
+            const socialSearchTerms = [...new Set([
+                term,
+                clean,
+                cleanHandle,
+                `facebook.com/${cleanHandle}`,
+                `twitter.com/${cleanHandle}`,
+                `instagram.com/${cleanHandle}`,
+                `linkedin.com/in/${cleanHandle}`,
+                `pinterest.com/${cleanHandle}`,
+                `youtube.com/${cleanHandle}`
+            ].filter(Boolean))];
+
             query = {
                 $or: [
-                    { twitter: handle },
-                    { facebook: handle },
-                    { instagram: handle },
-                    { linkedin: handle },
-                    { pinterest: handle },
-                    { youtube: handle },
-                    { twitter: { $gte: handle, $lt: handle + '\uffff' } },
-                    { facebook: { $gte: handle, $lt: handle + '\uffff' } },
-                    { instagram: { $gte: handle, $lt: handle + '\uffff' } },
-                    { linkedin: { $gte: handle, $lt: handle + '\uffff' } },
-                    { pinterest: { $gte: handle, $lt: handle + '\uffff' } },
-                    { youtube: { $gte: handle, $lt: handle + '\uffff' } }
+                    { facebook:  { $in: socialSearchTerms } },
+                    { twitter:   { $in: socialSearchTerms } },
+                    { instagram: { $in: socialSearchTerms } },
+                    { linkedin:  { $in: socialSearchTerms } },
+                    { pinterest: { $in: socialSearchTerms } },
+                    { youtube:   { $in: socialSearchTerms } },
+                    { facebook:  { $gte: `facebook.com/${cleanHandle}`,  $lt: `facebook.com/${cleanHandle}\uffff` } },
+                    { twitter:   { $gte: `twitter.com/${cleanHandle}`,   $lt: `twitter.com/${cleanHandle}\uffff` } },
+                    { instagram: { $gte: `instagram.com/${cleanHandle}`, $lt: `instagram.com/${cleanHandle}\uffff` } }
                 ]
             };
         } else if (type === 'postcode') {
@@ -643,58 +649,77 @@ const searchSocialScrape = async (req, res) => {
                 ]
             };
         } else {
-            // 'all': smart routing
+            // 'all': smart multi-field B-tree query (hits individual B-tree indexes, no $text required)
+            const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').trim();
+            const cleanLower = clean.toLowerCase();
+            const normPc = normalizeSearchPostcode(term);
             const digitCount = (term.match(/\d/g) || []).length;
-            const isLikelyPhone = digitCount >= 7 && /^[\d\s+()-]+$/.test(term);
+            const isPhone = digitCount >= 7 && /^[\d\s+()-]+$/.test(term);
 
-            if (isLikelyPhone) {
-                const cleanPhone = term.replace(/[^0-9+]/g, '');
-                query = {
-                    $or: [
-                        { 'phone.number': cleanPhone },
-                        { 'phone.number': term },
-                        { 'phone.number': { $gte: cleanPhone, $lt: cleanPhone + '\uffff' } }
-                    ]
-                };
-            } else if (term.includes('@') && !term.includes(' ')) {
-                // Email format in 'all' — use direct B-tree lookup
-                const cleanEmail = term.toLowerCase().trim();
-                query = {
-                    $or: [
-                        { email: cleanEmail },
-                        { email: { $gte: cleanEmail, $lt: cleanEmail + '\uffff' } }
-                    ]
-                };
-            } else if (/^(https?:\/\/)?(www\.)?(twitter|x|facebook|instagram|linkedin|pinterest|youtube)\.com/i.test(term)) {
-                // Social profile URL in 'all'
-                const cleanHandle = term
-                    .replace(/^https?:\/\//i, '')
-                    .replace(/^www\./i, '')
-                    .replace(/^(twitter|x|facebook|instagram|linkedin|pinterest|youtube)\.com\/?(in\/|user\/|company\/)?/i, '')
-                    .replace(/^@/, '')
-                    .replace(/\/+$/, '')
-                    .trim();
-                const handle = cleanHandle || term;
-                query = {
-                    $or: [
-                        { twitter: handle },
-                        { facebook: handle },
-                        { instagram: handle },
-                        { linkedin: handle },
-                        { pinterest: handle },
-                        { youtube: handle },
-                        { twitter: { $gte: handle, $lt: handle + '\uffff' } },
-                        { facebook: { $gte: handle, $lt: handle + '\uffff' } },
-                        { instagram: { $gte: handle, $lt: handle + '\uffff' } },
-                        { linkedin: { $gte: handle, $lt: handle + '\uffff' } },
-                        { pinterest: { $gte: handle, $lt: handle + '\uffff' } },
-                        { youtube: { $gte: handle, $lt: handle + '\uffff' } }
-                    ]
-                };
-            } else {
-                // Standard text search only as genuine fallback
-                query = { $text: { $search: term } };
+            const conditions = [];
+
+            // 1. Website URL (hits url_1_date_1)
+            conditions.push(
+                { url: cleanLower },
+                { url: { $gte: cleanLower, $lt: cleanLower + '\uffff' } }
+            );
+
+            // 2. Postcode (hits postcode_1)
+            if (normPc && normPc.length >= 2) {
+                conditions.push(
+                    { postcode: normPc },
+                    { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                );
             }
+
+            // 3. Email (hits email_1)
+            if (term.includes('@') || cleanLower.includes('.')) {
+                conditions.push(
+                    { email: cleanLower },
+                    { email: { $gte: cleanLower, $lt: cleanLower + '\uffff' } }
+                );
+            }
+
+            // 4. Phone (hits phone.number_1)
+            if (isPhone) {
+                const cleanPhone = term.replace(/[^0-9+]/g, '');
+                conditions.push(
+                    { 'phone.number': cleanPhone },
+                    { 'phone.number': { $gte: cleanPhone, $lt: cleanPhone + '\uffff' } }
+                );
+            }
+
+            // 5. Social handles (hits facebook_1, twitter_1, instagram_1, linkedin_1, pinterest_1, youtube_1)
+            const cleanHandle = clean
+                .replace(/^(twitter|x|facebook|instagram|linkedin|pinterest|youtube)\.com\/?(in\/|user\/|company\/)?/i, '')
+                .replace(/^@/, '')
+                .trim();
+
+            const socialSearchTerms = [...new Set([
+                term,
+                clean,
+                cleanHandle,
+                `facebook.com/${cleanHandle}`,
+                `twitter.com/${cleanHandle}`,
+                `instagram.com/${cleanHandle}`,
+                `linkedin.com/in/${cleanHandle}`,
+                `pinterest.com/${cleanHandle}`,
+                `youtube.com/${cleanHandle}`
+            ].filter(Boolean))];
+
+            conditions.push(
+                { facebook:  { $in: socialSearchTerms } },
+                { twitter:   { $in: socialSearchTerms } },
+                { instagram: { $in: socialSearchTerms } },
+                { linkedin:  { $in: socialSearchTerms } },
+                { pinterest: { $in: socialSearchTerms } },
+                { youtube:   { $in: socialSearchTerms } },
+                { facebook:  { $gte: `facebook.com/${cleanHandle}`,  $lt: `facebook.com/${cleanHandle}\uffff` } },
+                { twitter:   { $gte: `twitter.com/${cleanHandle}`,   $lt: `twitter.com/${cleanHandle}\uffff` } },
+                { instagram: { $gte: `instagram.com/${cleanHandle}`, $lt: `instagram.com/${cleanHandle}\uffff` } }
+            );
+
+            query = { $or: conditions };
         }
 
         if (cursor && mongoose.isValidObjectId(cursor)) {
