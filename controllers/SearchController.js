@@ -600,21 +600,13 @@ const searchSocialScrape = async (req, res) => {
                 ]
             };
         } else if (type === 'email') {
-            const cleanEmail = term.toLowerCase();
-            query = {
-                $or: [
-                    { email: cleanEmail },
-                    { email: { $gte: cleanEmail, $lt: cleanEmail + '\uffff' } }
-                ]
-            };
+            const cleanEmail = term.toLowerCase().trim();
+            // Use text index search — never unindexed field query on 85M docs (prevents 504 timeout)
+            query = { $text: { $search: `"${cleanEmail}"` } };
         } else if (type === 'postcode') {
             const normPc = normalizeSearchPostcode(term);
-            query = {
-                $or: [
-                    { postcode: normPc },
-                    { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
-                ]
-            };
+            // Use text index search — never unindexed field query on 85M docs (prevents 504 timeout)
+            query = { $text: { $search: `"${normPc}"` } };
         } else {
             // 'all': check if query looks like a phone number (e.g. 03707555088, +44..., digits)
             const digitCount = (term.match(/\d/g) || []).length;
@@ -654,12 +646,33 @@ const searchSocialScrape = async (req, res) => {
             _id: 1
         };
 
-        const cursorRows = await SocialScrape
+        let cursorRows = await SocialScrape
             .find(query, projection)
             .sort({ _id: 1 })
             .limit(lim + 1)
             .maxTimeMS(MAX_TIME_MS)
             .lean();
+
+        // If email search returned 0 (e.g. text index still building or single-field),
+        // fallback to matching the email's domain against the indexed url field
+        if (type === 'email' && cursorRows.length === 0 && !cursor && term.includes('@')) {
+            const domain = term.split('@')[1]?.toLowerCase().trim();
+            if (domain && domain.includes('.')) {
+                const domainVariants = [
+                    domain,
+                    `http://${domain}`,
+                    `https://${domain}`,
+                    `http://www.${domain}`,
+                    `https://www.${domain}`
+                ];
+                cursorRows = await SocialScrape
+                    .find({ url: { $in: domainVariants } }, projection)
+                    .sort({ _id: 1 })
+                    .limit(lim + 1)
+                    .maxTimeMS(MAX_TIME_MS)
+                    .lean();
+            }
+        }
 
         const hasNextPage = cursorRows.length > lim;
         const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
