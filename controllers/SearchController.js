@@ -340,13 +340,7 @@ const searchCompany = async (req, res) => {
                 }
 
                 const cursorRows = await ChData
-                    .find(textQuery, {
-                        CompanyName: 1, CompanyNumber: 1,
-                        'RegAddress.AddressLine1': 1, 'RegAddress.PostTown': 1,
-                        'RegAddress.PostCode': 1, CompanyStatus: 1,
-                        IncorporationDate: 1, _id: 1,
-                        score: { $meta: 'textScore' },
-                    })
+                    .find(textQuery, { score: { $meta: 'textScore' } })
                     .sort({ score: { $meta: 'textScore' }, _id: 1 })
                     .limit(lim + 1)
                     .maxTimeMS(MAX_TIME_MS)
@@ -368,7 +362,12 @@ const searchCompany = async (req, res) => {
             } catch (textErr) {
                 // Text index fallback: prefix match with anchored regex if text index is not yet built
                 const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                query = { CompanyName: { $regex: `^${escaped}`, $options: 'i' } };
+                query = {
+                    $or: [
+                        { CompanyName: { $regex: `^${escaped}`, $options: 'i' } },
+                        { CompanyNumber: term.trim() }
+                    ]
+                };
                 if (cursor && mongoose.isValidObjectId(cursor)) {
                     query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
                 }
@@ -377,12 +376,7 @@ const searchCompany = async (req, res) => {
         }
 
         const cursorRows = await ChData
-            .find(query, {
-                CompanyName: 1, CompanyNumber: 1,
-                'RegAddress.AddressLine1': 1, 'RegAddress.PostTown': 1,
-                'RegAddress.PostCode': 1, CompanyStatus: 1,
-                IncorporationDate: 1, _id: 1,
-            })
+            .find(query)
             .sort(sortStage)
             .limit(lim + 1)
             .maxTimeMS(MAX_TIME_MS)
@@ -414,11 +408,17 @@ const searchCompany = async (req, res) => {
 };
 
 function formatCompany(d) {
+    const line1 = d['RegAddress.AddressLine1'] || d.RegAddress?.AddressLine1 || d.AddressLine1 || '';
+    const line2 = d['RegAddress.AddressLine2'] || d.RegAddress?.AddressLine2 || d.AddressLine2 || '';
+    const town  = d['RegAddress.PostTown']     || d.RegAddress?.PostTown     || d.PostTown     || '';
+    const pc    = d['RegAddress.PostCode']     || d.RegAddress?.PostCode     || d.PostCode     || '';
+
+    const parts = [line1, line2, town, pc].filter(Boolean);
+
     return {
         name:         d.CompanyName,
         number:       d.CompanyNumber,
-        address:      [d['RegAddress.AddressLine1'], d['RegAddress.PostTown'], d['RegAddress.PostCode']]
-                         .filter(Boolean).join(', '),
+        address:      parts.length > 0 ? parts.join(', ') : null,
         status:       d.CompanyStatus,
         incorporated: d.IncorporationDate,
     };
