@@ -616,8 +616,23 @@ const searchSocialScrape = async (req, res) => {
                 ]
             };
         } else {
-            // 'all': use text index search across all indexed fields
-            query = { $text: { $search: term } };
+            // 'all': check if query looks like a phone number (e.g. 03707555088, +44..., digits)
+            const digitCount = (term.match(/\d/g) || []).length;
+            const isLikelyPhone = digitCount >= 7 && /^[\d\s+()-]+$/.test(term);
+
+            if (isLikelyPhone) {
+                const cleanPhone = term.replace(/[^0-9+]/g, '');
+                query = {
+                    $or: [
+                        { 'phone.number': cleanPhone },
+                        { 'phone.number': term },
+                        { 'phone.number': { $gte: cleanPhone, $lt: cleanPhone + '\uffff' } }
+                    ]
+                };
+            } else {
+                // standard text search across url, email, postcode, social handles
+                query = { $text: { $search: term } };
+            }
         }
 
         if (cursor && mongoose.isValidObjectId(cursor)) {
