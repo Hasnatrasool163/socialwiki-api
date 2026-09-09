@@ -6,7 +6,7 @@ const userSchema = new mongoose.Schema({
     role:     { type: String, enum: ['user', 'admin'], default: 'user' },
 
     // --- search plan / rate-limit fields ---
-    plan:            { type: String, enum: ['free', 'paid', 'admin'], default: 'free' },
+    plan:            { type: String, enum: ['pending', 'free', 'paid', 'admin'], default: 'pending' },
     searchCount:     { type: Number, default: 0 },
     searchResetDate: { type: Date,   default: () => new Date() },
 }, {
