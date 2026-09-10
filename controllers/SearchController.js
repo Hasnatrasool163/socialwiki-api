@@ -591,14 +591,23 @@ const searchSocialScrape = async (req, res) => {
                 ]
             };
         } else if (type === 'phone') {
+            const digits = term.replace(/\D/g, '');
             const cleanPhone = term.replace(/[^0-9+]/g, '');
-            query = {
-                $or: [
-                    { 'phone.number': cleanPhone },
-                    { 'phone.number': term },
-                    { 'phone.number': { $gte: cleanPhone, $lt: cleanPhone + '\uffff' } }
-                ]
-            };
+            let ukPhone = digits;
+            if (digits.startsWith('44') && digits.length >= 10) {
+                ukPhone = '0' + digits.slice(2);
+            }
+            const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
+            const phoneConds = [];
+            for (const p of phoneVariants) {
+                phoneConds.push(
+                    { 'phone.number': p },
+                    { 'phone.number': { $gte: p, $lt: p + '\uffff' } },
+                    { phone: p },
+                    { phone: { $gte: p, $lt: p + '\uffff' } }
+                );
+            }
+            query = { $or: phoneConds };
         } else if (type === 'email') {
             const cleanEmail = term.toLowerCase().trim();
             // Direct B-Tree index lookup — O(1) instantaneous scan, avoids 148s text token explosion on .co.uk
@@ -654,7 +663,7 @@ const searchSocialScrape = async (req, res) => {
             const cleanLower = clean.toLowerCase();
             const normPc = normalizeSearchPostcode(term);
             const digitCount = (term.match(/\d/g) || []).length;
-            const isPhone = digitCount >= 7 && /^[\d\s+()-]+$/.test(term);
+            const isPhone = digitCount >= 4 && /^[\d\s+()-]+$/.test(term.trim());
 
             const conditions = [];
 
@@ -682,11 +691,21 @@ const searchSocialScrape = async (req, res) => {
 
             // 4. Phone (hits phone.number_1)
             if (isPhone) {
+                const digits = term.replace(/\D/g, '');
                 const cleanPhone = term.replace(/[^0-9+]/g, '');
-                conditions.push(
-                    { 'phone.number': cleanPhone },
-                    { 'phone.number': { $gte: cleanPhone, $lt: cleanPhone + '\uffff' } }
-                );
+                let ukPhone = digits;
+                if (digits.startsWith('44') && digits.length >= 10) {
+                    ukPhone = '0' + digits.slice(2);
+                }
+                const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
+                for (const p of phoneVariants) {
+                    conditions.push(
+                        { 'phone.number': p },
+                        { 'phone.number': { $gte: p, $lt: p + '\uffff' } },
+                        { phone: p },
+                        { phone: { $gte: p, $lt: p + '\uffff' } }
+                    );
+                }
             }
 
             // 5. Social handles (hits facebook_1, twitter_1, instagram_1, linkedin_1, pinterest_1, youtube_1)
