@@ -602,9 +602,7 @@ const searchSocialScrape = async (req, res) => {
             for (const p of phoneVariants) {
                 phoneConds.push(
                     { 'phone.number': p },
-                    { 'phone.number': { $gte: p, $lt: p + '\uffff' } },
-                    { phone: p },
-                    { phone: { $gte: p, $lt: p + '\uffff' } }
+                    { 'phone.number': { $gte: p, $lt: p + '\uffff' } }
                 );
             }
             query = { $or: phoneConds };
@@ -701,9 +699,7 @@ const searchSocialScrape = async (req, res) => {
                 for (const p of phoneVariants) {
                     conditions.push(
                         { 'phone.number': p },
-                        { 'phone.number': { $gte: p, $lt: p + '\uffff' } },
-                        { phone: p },
-                        { phone: { $gte: p, $lt: p + '\uffff' } }
+                        { 'phone.number': { $gte: p, $lt: p + '\uffff' } }
                     );
                 }
             }
