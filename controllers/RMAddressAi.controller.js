@@ -6,7 +6,8 @@ const RMAddressAiCorrection = null;
 // const RMAddressManualReview = require('../models/RMAddressManualReview');
 const RMAddressManualReview = null;
 const AddressMasterMerged = require('../models/AddressMasterMerged');
-const AddressMasterChecked = require('../models/AddressMasterChecked');
+// const AddressMasterChecked = require('../models/AddressMasterChecked');
+const AddressMasterChecked = null;
 const AddressMasterPending = require('../models/AddressMasterPending');
 // const AddressMasterAiTemp = require('../models/AddressMasterAiTemp');
 const AddressMasterAiTemp = null;
@@ -64,7 +65,7 @@ const getSourceModel = (sourceCollection) => {
         // case 'address_master_precheck': return require('../models/AddressMasterPrecheck');
         // case 'address_master_ai_queue': return require('../models/AddressMasterAiQueue');
         case 'address_master_pending':  return require('../models/AddressMasterPending');
-        case 'address_master_checked':  return AddressMasterChecked;
+        // case 'address_master_checked':  return AddressMasterChecked;
         default:                        return AddressMasterMerged;
     }
 };
@@ -93,6 +94,8 @@ const groupByPostcode = (records) => {
 const upsertChecked = async (postcode, addressParts, dateCreated) => {
     const district = await resolveDistrict(postcode);
     if (!district) return { ok: false, reason: `No district found for postcode ${postcode}` };
+
+    if (!AddressMasterChecked) return { ok: true };
 
     await AddressMasterChecked.updateOne(
         { postcode, address: JSON.stringify(addressParts) },
@@ -629,7 +632,7 @@ const bulkApproveCorrections = async (req, res) => {
             );
         }
 
-        if (checkedOps.length) {
+        if (checkedOps.length && AddressMasterChecked) {
             await AddressMasterChecked.bulkWrite(checkedOps, { ordered: false });
         }
 
@@ -1149,7 +1152,9 @@ const checkAndConfirmBatch = async (jobId, batchNumber) => {
         }
     }));
 
-    await AddressMasterChecked.bulkWrite(checkedOps, { ordered: false });
+    if (AddressMasterChecked) {
+        await AddressMasterChecked.bulkWrite(checkedOps, { ordered: false });
+    }
 
     const originalIds = tempRecords.map(r => r.originalId);
     await SourceModel.deleteMany({ _id: { $in: originalIds } });

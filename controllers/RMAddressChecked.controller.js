@@ -1,4 +1,5 @@
-const AddressMasterChecked  = require('../models/AddressMasterChecked');
+// const AddressMasterChecked  = require('../models/AddressMasterChecked');
+const AddressMasterChecked = null;
 // const AddressMasterPrecheck = require('../models/AddressMasterPrecheck');
 const AddressMasterPrecheck = null;
 const rmAddressLogger       = require('../config/loggers/rmAddressLogger');
@@ -16,9 +17,9 @@ const searchBlock = async (req, res) => {
             return res.status(400).json({ success: false, message: 'postcode is required' });
         }
 
-        const records = await AddressMasterChecked.find({ postcode })
+        const records = AddressMasterChecked ? await AddressMasterChecked.find({ postcode })
             .sort({ _id: 1 })
-            .lean();
+            .lean() : [];
 
         if (!records.length) {
             return res.json({
@@ -64,6 +65,10 @@ const searchBlock = async (req, res) => {
 const deleteRecordAndRecycle = async (req, res) => {
     try {
         const { id } = req.params;
+
+        if (!AddressMasterChecked) {
+            return res.json({ success: true, message: 'Collection dropped' });
+        }
 
         const record = await AddressMasterChecked.findById(id).lean();
         if (!record) {

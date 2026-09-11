@@ -3,7 +3,8 @@ const mongoose              = require('mongoose');
 // const AddressMasterAiQueue  = require('../models/AddressMasterAiQueue');
 const AddressMasterPrecheck = null;
 const AddressMasterAiQueue  = null;
-const AddressMasterChecked  = require('../models/AddressMasterChecked');
+// const AddressMasterChecked  = require('../models/AddressMasterChecked');
+const AddressMasterChecked  = null;
 const rmAddressLogger       = require('../config/loggers/rmAddressLogger');
 
 const addressPartsFromDoc = (address) => {
@@ -27,7 +28,8 @@ const getStats = async (req, res) => {
             // AddressMasterAiQueue.estimatedDocumentCount(),
             0,
             0,
-            AddressMasterChecked.estimatedDocumentCount()
+            // AddressMasterChecked.estimatedDocumentCount()
+            0
         ]);
         return res.json({ success: true, stats: { precheckCount, aiQueueCount, checkedCount } });
     } catch (error) {
@@ -118,7 +120,9 @@ const approveBlock = async (req, res) => {
             }
         }));
 
-        await AddressMasterChecked.bulkWrite(ops, { ordered: false });
+        if (AddressMasterChecked) {
+            await AddressMasterChecked.bulkWrite(ops, { ordered: false });
+        }
         await AddressMasterPrecheck.deleteMany({ postcode });
 
         rmAddressLogger.info(`Precheck approved: ${postcode} (${records.length} records) → address_master_checked`);
