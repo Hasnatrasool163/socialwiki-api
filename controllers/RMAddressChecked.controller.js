@@ -1,5 +1,6 @@
 const AddressMasterChecked  = require('../models/AddressMasterChecked');
-const AddressMasterPrecheck = require('../models/AddressMasterPrecheck');
+// const AddressMasterPrecheck = require('../models/AddressMasterPrecheck');
+const AddressMasterPrecheck = null;
 const rmAddressLogger       = require('../config/loggers/rmAddressLogger');
 const { addressPartsFromDoc, normalizePostcode } = require('../utils/addressParts');
 
@@ -81,6 +82,8 @@ const deleteRecordAndRecycle = async (req, res) => {
         let duplicateSkipped = 0;
 
         if (remaining.length) {
+            // Collection dropped: AddressMasterPrecheck bulkWrite disabled
+            /*
             const ops = remaining.map(r => ({
                 updateOne: {
                     filter: { postcode: r.postcode, address: r.address },
@@ -98,13 +101,13 @@ const deleteRecordAndRecycle = async (req, res) => {
             const bulkResult = await AddressMasterPrecheck.bulkWrite(ops, { ordered: false })
                 .catch(err => err); 
 
-        
             if (bulkResult && bulkResult.writeErrors && bulkResult.writeErrors.length) {
                 duplicateSkipped = bulkResult.writeErrors.length;
                 rmAddressLogger.warn(
                     `Checked recycle: ${duplicateSkipped} record(s) for ${postcode} hit a duplicate-key conflict moving to precheck — check manually.`
                 );
             }
+            */
 
             const remainingIds = remaining.map(r => r._id);
             await AddressMasterChecked.deleteMany({ _id: { $in: remainingIds } });

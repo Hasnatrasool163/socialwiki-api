@@ -467,8 +467,8 @@ const searchScreenshot = async (req, res) => {
         ];
         const variants = [...new Set(candidates)];
 
-        // 1. First attempt instant index point lookup with variants
-        let query = { url: { $in: variants } };
+        // 1. First attempt instant index point lookup with variants (exclude blacklisted)
+        let query = { url: { $in: variants }, is_blacklisted: { $ne: true } };
 
         if (cursor && mongoose.isValidObjectId(cursor)) {
             query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
@@ -482,7 +482,7 @@ const searchScreenshot = async (req, res) => {
             .lean();
 
         // 2. If no exact match and query is a prefix/partial search (e.g. "043" or "b-m"),
-        // perform pure B-Tree index range scans (NEVER case-insensitive regex)
+        // perform pure B-Tree index range scans (exclude blacklisted)
         if (cursorRows.length === 0 && !cursor) {
             const prefixConditions = [
                 { url: { $gte: `http://${cleanLower}`, $lt: `http://${cleanLower}\uffff` } },
@@ -493,7 +493,7 @@ const searchScreenshot = async (req, res) => {
             ];
 
             cursorRows = await ScreenshotUrl
-                .find({ $or: prefixConditions }, { url: 1, image: 1, _id: 1 })
+                .find({ $and: [{ $or: prefixConditions }, { is_blacklisted: { $ne: true } }] }, { url: 1, image: 1, _id: 1 })
                 .sort({ url: 1, image: 1 })
                 .limit(lim + 1)
                 .maxTimeMS(MAX_TIME_MS)
@@ -741,6 +741,9 @@ const searchSocialScrape = async (req, res) => {
             query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
         }
 
+        // Exclude blacklisted records from search
+        query.is_blacklisted = { $ne: true };
+
         const projection = {
             url: 1,
             date: 1,
@@ -776,7 +779,7 @@ const searchSocialScrape = async (req, res) => {
                     `https://www.${domain}`
                 ];
                 cursorRows = await SocialScrape
-                    .find({ url: { $in: domainVariants } }, projection)
+                    .find({ url: { $in: domainVariants }, is_blacklisted: { $ne: true } }, projection)
                     .sort({ _id: 1 })
                     .limit(lim + 1)
                     .maxTimeMS(MAX_TIME_MS)

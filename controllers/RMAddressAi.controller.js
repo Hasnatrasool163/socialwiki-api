@@ -1,13 +1,18 @@
 const mongoose = require('mongoose');
-const RMAddressAiJob = require('../models/RMAddressAiJob');
-const RMAddressAiCorrection = require('../models/RMAddressAiCorrection');
-const RMAddressManualReview = require('../models/RMAddressManualReview');
+// const RMAddressAiJob = require('../models/RMAddressAiJob');
+const RMAddressAiJob = null;
+// const RMAddressAiCorrection = require('../models/RMAddressAiCorrection');
+const RMAddressAiCorrection = null;
+// const RMAddressManualReview = require('../models/RMAddressManualReview');
+const RMAddressManualReview = null;
 const AddressMasterMerged = require('../models/AddressMasterMerged');
 const AddressMasterChecked = require('../models/AddressMasterChecked');
 const AddressMasterPending = require('../models/AddressMasterPending');
-const AddressMasterAiTemp = require('../models/AddressMasterAiTemp');
+// const AddressMasterAiTemp = require('../models/AddressMasterAiTemp');
+const AddressMasterAiTemp = null;
 const PostcodeDistrict = require('../models/PostcodeDistrict');
-const AddressMasterAiQueue = require('../models/AddressMasterAiQueue');
+// const AddressMasterAiQueue = require('../models/AddressMasterAiQueue');
+const AddressMasterAiQueue = null;
 const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 const { parse } = require('csv-parse');
 const fs = require('fs');
@@ -56,8 +61,8 @@ const getDateCreated = () => {
 
 const getSourceModel = (sourceCollection) => {
     switch (sourceCollection) {
-        case 'address_master_precheck': return require('../models/AddressMasterPrecheck');
-        case 'address_master_ai_queue': return require('../models/AddressMasterAiQueue');
+        // case 'address_master_precheck': return require('../models/AddressMasterPrecheck');
+        // case 'address_master_ai_queue': return require('../models/AddressMasterAiQueue');
         case 'address_master_pending':  return require('../models/AddressMasterPending');
         case 'address_master_checked':  return AddressMasterChecked;
         default:                        return AddressMasterMerged;
@@ -110,11 +115,11 @@ const createJob = async (req, res) => {
     try {
         const { jobName, sourceCollection } = req.body || {};
 
-        const validCollections = ['address_master_merged', 'address_master_pending', 'address_master_precheck', 'address_master_ai_queue'];
+        const validCollections = ['address_master_merged', 'address_master_pending'];
 
         const resolvedSource = validCollections.includes(sourceCollection)
             ? sourceCollection
-            : 'address_master_ai_queue';
+            : 'address_master_merged';
 
         const job = await RMAddressAiJob.create({
             jobName: jobName || `ai_run_${Date.now()}`,
@@ -380,7 +385,7 @@ const submitBatchResults = async (req, res) => {
                 return {
                     jobId,
                     originalId:         new mongoose.Types.ObjectId(r.originalId),
-                    sourceCollection:   job.sourceCollection || 'address_master_ai_queue',
+                    sourceCollection:   job.sourceCollection || 'address_master_merged',
                     postcode:           original.postcode,
                     district:           original.district,
                     address:            original.address,
@@ -609,7 +614,7 @@ const bulkApproveCorrections = async (req, res) => {
                 }
             });
 
-            const src = jobMap[String(c.jobId)]?.sourceCollection || 'address_master_ai_queue';
+            const src = jobMap[String(c.jobId)]?.sourceCollection || 'address_master_merged';
             (deletesBySource[src] ||= []).push(c.originalId);
 
             approvedIds.push(c._id);
@@ -1126,7 +1131,7 @@ const checkAndConfirmBatch = async (jobId, batchNumber) => {
     if (!tempRecords.length) return;
 
     const job = await RMAddressAiJob.findById(jobId).lean();
-    const SourceModel = getSourceModel(job?.sourceCollection || 'address_master_ai_queue');
+    const SourceModel = getSourceModel(job?.sourceCollection || 'address_master_merged');
 
     const dateCreated = getDateCreated();
     const checkedOps  = tempRecords.map(r => ({

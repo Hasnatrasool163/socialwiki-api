@@ -1,6 +1,8 @@
 const mongoose              = require('mongoose');
-const AddressMasterPrecheck = require('../models/AddressMasterPrecheck');
-const AddressMasterAiQueue  = require('../models/AddressMasterAiQueue');
+// const AddressMasterPrecheck = require('../models/AddressMasterPrecheck');
+// const AddressMasterAiQueue  = require('../models/AddressMasterAiQueue');
+const AddressMasterPrecheck = null;
+const AddressMasterAiQueue  = null;
 const AddressMasterChecked  = require('../models/AddressMasterChecked');
 const rmAddressLogger       = require('../config/loggers/rmAddressLogger');
 
@@ -21,8 +23,10 @@ const addressPartsFromDoc = (address) => {
 const getStats = async (req, res) => {
     try {
         const [precheckCount, aiQueueCount, checkedCount] = await Promise.all([
-            AddressMasterPrecheck.estimatedDocumentCount(),
-            AddressMasterAiQueue.estimatedDocumentCount(),
+            // AddressMasterPrecheck.estimatedDocumentCount(),
+            // AddressMasterAiQueue.estimatedDocumentCount(),
+            0,
+            0,
             AddressMasterChecked.estimatedDocumentCount()
         ]);
         return res.json({ success: true, stats: { precheckCount, aiQueueCount, checkedCount } });

@@ -4,7 +4,8 @@ const { parse } = require('csv-parse');
 
 const AddressMasterMerged = require('../models/AddressMasterMerged');
 const PostcodeDistrict = require('../models/PostcodeDistrict');
-const RMAddressEditJob = require('../models/RMAddressEditJob');
+// const RMAddressEditJob = require('../models/RMAddressEditJob');
+const RMAddressEditJob = null;
 const RMAddressDeletedBackup = require('../models/RMAddressDeletedBackup');
 const rmAddressLogger = require('../config/loggers/rmAddressLogger');
 
