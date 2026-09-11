@@ -597,12 +597,15 @@ const searchSocialScrape = async (req, res) => {
             if (digits.startsWith('44') && digits.length >= 10) {
                 ukPhone = '0' + digits.slice(2);
             }
+            if (digits.length === 10 && !digits.startsWith('0') && !digits.startsWith('44')) {
+                ukPhone = '0' + digits;
+            }
             const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
             const phoneConds = [];
             for (const p of phoneVariants) {
                 phoneConds.push(
                     { 'phone.number': p },
-                    { 'phone.number': { $gte: p, $lt: p + '\uffff' } }
+                    { phone: { $elemMatch: { number: { $gte: p, $lt: p + '\uffff' } } } }
                 );
             }
             query = { $or: phoneConds };
@@ -695,11 +698,14 @@ const searchSocialScrape = async (req, res) => {
                 if (digits.startsWith('44') && digits.length >= 10) {
                     ukPhone = '0' + digits.slice(2);
                 }
+                if (digits.length === 10 && !digits.startsWith('0') && !digits.startsWith('44')) {
+                    ukPhone = '0' + digits;
+                }
                 const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
                 for (const p of phoneVariants) {
                     conditions.push(
                         { 'phone.number': p },
-                        { 'phone.number': { $gte: p, $lt: p + '\uffff' } }
+                        { phone: { $elemMatch: { number: { $gte: p, $lt: p + '\uffff' } } } }
                     );
                 }
             }
