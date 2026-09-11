@@ -15,6 +15,7 @@ const AddressMasterMerged = require('../models/AddressMasterMerged');
 const PropPrice           = require('../models/PropPrice');
 const ScreenshotUrl       = require('../models/ScreenshotUrl');
 const SocialScrape        = require('../models/SocialScrape');
+const FoundBusiness       = require('../models/FoundBusiness');
 const ChData = mongoose.models.ChData ||
     mongoose.model('ChData', new mongoose.Schema({}, {
         strict: false,
@@ -824,7 +825,189 @@ const searchSocialScrape = async (req, res) => {
     }
 };
 
-// ── 6. Usage stats ─────────────────────────────────────────────────────────
+// ── 6. Business search (found_business_corrected: 1.5M docs) ───────────────
+
+function formatBusiness(d) {
+    return {
+        _id: d._id,
+        title: d.title || null,
+        address: d.address || null,
+        postcode: d.postcode || null,
+        phone: d.phone || null,
+        url: d.url || null,
+        date: d.date || null
+    };
+}
+
+const searchBusiness = async (req, res) => {
+    try {
+        const { q = '', type = 'all', cursor, limit } = req.query;
+        const term = q.trim();
+        if (!term || term.length < 2) {
+            return res.status(400).json({ success: false, message: 'Query must be at least 2 characters.' });
+        }
+
+        const lim = Math.min(parseInt(limit, 10) || SEARCH_LIMIT, SEARCH_LIMIT);
+        let query = {};
+
+        if (type === 'name') {
+            query = {
+                $or: [
+                    { title: term },
+                    { title: term.toUpperCase() },
+                    { title: { $gte: term, $lt: term + '\uffff' } },
+                    { title: { $gte: term.toUpperCase(), $lt: term.toUpperCase() + '\uffff' } }
+                ]
+            };
+        } else if (type === 'postcode') {
+            const normPc = normalizeSearchPostcode(term);
+            const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
+            if (fullPostcodeRegex.test(normPc)) {
+                query.postcode = normPc;
+            } else {
+                query = {
+                    $or: [
+                        { postcode: normPc },
+                        { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                    ]
+                };
+            }
+        } else if (type === 'phone') {
+            const digits = term.replace(/\D/g, '');
+            const cleanPhone = term.replace(/[^0-9+]/g, '');
+            let ukPhone = digits;
+            if (digits.startsWith('44') && digits.length >= 10) {
+                ukPhone = '0' + digits.slice(2);
+            }
+            if (digits.length === 10 && !digits.startsWith('0') && !digits.startsWith('44')) {
+                ukPhone = '0' + digits;
+            }
+            const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
+            const phoneConds = [];
+            for (const p of phoneVariants) {
+                phoneConds.push(
+                    { phone: p },
+                    { phone: { $gte: p, $lt: p + '\uffff' } }
+                );
+            }
+            query = { $or: phoneConds };
+        } else if (type === 'url') {
+            const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').toLowerCase();
+            query = {
+                $or: [
+                    { url: clean },
+                    { url: term },
+                    { url: { $gte: clean, $lt: clean + '\uffff' } }
+                ]
+            };
+        } else if (type === 'address') {
+            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            query = { address: { $regex: escaped, $options: 'i' } };
+        } else {
+            // 'all': multi-field query
+            const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').trim();
+            const cleanLower = clean.toLowerCase();
+            const upperTerm = term.toUpperCase();
+            const normPc = normalizeSearchPostcode(term);
+            const digitCount = (term.match(/\d/g) || []).length;
+            const isPhone = digitCount >= 4 && /^[\d\s+()-]+$/.test(term.trim());
+
+            const conditions = [];
+
+            // Title / Name
+            conditions.push(
+                { title: term },
+                { title: upperTerm },
+                { title: { $gte: term, $lt: term + '\uffff' } },
+                { title: { $gte: upperTerm, $lt: upperTerm + '\uffff' } }
+            );
+
+            // Postcode
+            if (normPc && normPc.length >= 2) {
+                conditions.push(
+                    { postcode: normPc },
+                    { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                );
+            }
+
+            // URL
+            if (cleanLower.includes('.') || term.includes('/')) {
+                conditions.push(
+                    { url: cleanLower },
+                    { url: { $gte: cleanLower, $lt: cleanLower + '\uffff' } }
+                );
+            }
+
+            // Phone
+            if (isPhone) {
+                const digits = term.replace(/\D/g, '');
+                const cleanPhone = term.replace(/[^0-9+]/g, '');
+                let ukPhone = digits;
+                if (digits.startsWith('44') && digits.length >= 10) {
+                    ukPhone = '0' + digits.slice(2);
+                }
+                if (digits.length === 10 && !digits.startsWith('0') && !digits.startsWith('44')) {
+                    ukPhone = '0' + digits;
+                }
+                const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
+                for (const p of phoneVariants) {
+                    conditions.push(
+                        { phone: p },
+                        { phone: { $gte: p, $lt: p + '\uffff' } }
+                    );
+                }
+            }
+
+            query = { $or: conditions };
+        }
+
+        if (cursor && mongoose.isValidObjectId(cursor)) {
+            query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+        }
+
+        const projection = {
+            title: 1,
+            postcode: 1,
+            address: 1,
+            phone: 1,
+            url: 1,
+            date: 1,
+            _id: 1
+        };
+
+        const cursorRows = await FoundBusiness
+            .find(query, projection)
+            .sort({ _id: 1 })
+            .limit(lim + 1)
+            .maxTimeMS(MAX_TIME_MS)
+            .lean();
+
+        const hasNextPage = cursorRows.length > lim;
+        const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
+        const data = rows.map(formatBusiness);
+        const nextCursor = hasNextPage && rows[rows.length - 1] ? String(rows[rows.length - 1]._id) : null;
+
+        return res.json({
+            success: true,
+            db: 'found_business_corrected',
+            count: data.length,
+            data,
+            cursor: nextCursor,
+            usage: usageBlock(req),
+        });
+    } catch (err) {
+        console.error('[searchBusiness]', err.message);
+        if (err.message && (err.message.includes('exceeded time limit') || err.message.includes('buffering timed out'))) {
+            return res.status(504).json({
+                success: false,
+                error: 'Search timed out. Try refining your search query or selecting a specific field.',
+            });
+        }
+        return res.status(500).json({ success: false, error: err.message });
+    }
+};
+
+// ── 7. Usage stats ─────────────────────────────────────────────────────────
 
 const getUsage = async (req, res) => {
     try {
@@ -857,5 +1040,6 @@ module.exports = {
     searchCompany,
     searchScreenshot,
     searchSocialScrape,
+    searchBusiness,
     getUsage
 };

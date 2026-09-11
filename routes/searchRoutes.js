@@ -16,6 +16,7 @@ const {
     searchCompany,
     searchScreenshot,
     searchSocialScrape,
+    searchBusiness,
     getUsage,
 } = require('../controllers/SearchController');
 
@@ -28,6 +29,7 @@ router.get('/prop-price', ...guard, searchPropPrice);
 router.get('/company',    ...guard, searchCompany);
 router.get('/screenshot', ...guard, searchScreenshot);
 router.get('/social',     ...guard, searchSocialScrape);
+router.get('/business',   ...guard, searchBusiness);
 
 // Usage stats — no rate-limit hit, just needs auth
 router.get('/usage', verifyToken, getUsage);
