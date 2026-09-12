@@ -18,6 +18,7 @@ const {
     searchSocialScrape,
     searchBusiness,
     searchWebsites,
+    searchThompson,
     getUsage,
 } = require('../controllers/SearchController');
 
@@ -25,14 +26,16 @@ const router = express.Router();
 
 const guard = [verifyToken, botProtect, searchRateLimit];
 
-router.get('/rm-address', ...guard, searchRmAddress);
-router.get('/prop-price', ...guard, searchPropPrice);
-router.get('/company',    ...guard, searchCompany);
-router.get('/screenshot', ...guard, searchScreenshot);
-router.get('/social',     ...guard, searchSocialScrape);
-router.get('/business',   ...guard, searchBusiness);
-router.get('/websites',   ...guard, searchWebsites);
-router.get('/website',    ...guard, searchWebsites);
+router.get('/rm-address',         ...guard, searchRmAddress);
+router.get('/prop-price',         ...guard, searchPropPrice);
+router.get('/company',            ...guard, searchCompany);
+router.get('/screenshot',         ...guard, searchScreenshot);
+router.get('/social',             ...guard, searchSocialScrape);
+router.get('/business',           ...guard, searchBusiness);
+router.get('/websites',           ...guard, searchWebsites);
+router.get('/website',            ...guard, searchWebsites);
+router.get('/thompson',           ...guard, searchThompson);
+router.get('/thompson-directory', ...guard, searchThompson);
 
 // Usage stats — no rate-limit hit, just needs auth
 router.get('/usage', verifyToken, getUsage);

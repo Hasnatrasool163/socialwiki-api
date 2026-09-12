@@ -17,6 +17,7 @@ const ScreenshotUrl       = require('../models/ScreenshotUrl');
 const SocialScrape        = require('../models/SocialScrape');
 const FoundBusiness       = require('../models/FoundBusiness');
 const WebsitePostcode     = require('../models/WebsitePostcode');
+const ThompsonImport      = require('../models/ThompsonImport');
 const ChData = mongoose.models.ChData ||
     mongoose.model('ChData', new mongoose.Schema({}, {
         strict: false,
@@ -1118,7 +1119,245 @@ const searchWebsites = async (req, res) => {
     }
 };
 
-// ── 8. Usage stats ─────────────────────────────────────────────────────────
+// ── 8. Thompson Directory search (thompson_import) ──────────────────────────
+
+function formatThompson(d) {
+    let phones = [];
+    if (Array.isArray(d.phone)) {
+        phones = d.phone.map(p => {
+            if (!p) return '';
+            if (typeof p === 'string') return p;
+            return p.number || '';
+        }).filter(Boolean);
+    } else if (d.phone) {
+        phones = [String(d.phone)];
+    }
+
+    let addressStr = '';
+    if (Array.isArray(d.address_lines)) {
+        addressStr = d.address_lines.filter(Boolean).join(', ');
+    } else if (d.address_lines) {
+        addressStr = String(d.address_lines);
+    }
+
+    let dateStr = d.raw_date_text || '';
+    if (!dateStr && d.date) {
+        try {
+            dateStr = new Date(d.date).toLocaleDateString('en-GB');
+        } catch {
+            dateStr = '';
+        }
+    }
+
+    return {
+        _id: d._id,
+        company_name: d.company_name || null,
+        postcode: d.postcode || null,
+        address: addressStr || null,
+        phone: phones,
+        url: d.url || null,
+        date: dateStr || null
+    };
+}
+
+const searchThompson = async (req, res) => {
+    try {
+        const { q = '', type = 'all', cursor, limit } = req.query;
+        const term = q.trim();
+        if (!term || term.length < 2) {
+            return res.status(400).json({ success: false, message: 'Query must be at least 2 characters.' });
+        }
+
+        const lim = Math.min(parseInt(limit, 10) || SEARCH_LIMIT, SEARCH_LIMIT);
+        let query = { is_blacklisted: { $ne: true } };
+
+        if (type === 'name') {
+            query = {
+                $and: [
+                    { is_blacklisted: { $ne: true } },
+                    {
+                        $or: [
+                            { company_name: term },
+                            { company_name: term.toUpperCase() },
+                            { company_name: { $gte: term, $lt: term + '\uffff' } },
+                            { company_name: { $gte: term.toUpperCase(), $lt: term.toUpperCase() + '\uffff' } }
+                        ]
+                    }
+                ]
+            };
+        } else if (type === 'postcode') {
+            const normPc = normalizeSearchPostcode(term);
+            const fullPostcodeRegex = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s[0-9][A-Z]{2}$/;
+            if (fullPostcodeRegex.test(normPc)) {
+                query = { is_blacklisted: { $ne: true }, postcode: normPc };
+            } else {
+                query = {
+                    $and: [
+                        { is_blacklisted: { $ne: true } },
+                        {
+                            $or: [
+                                { postcode: normPc },
+                                { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                            ]
+                        }
+                    ]
+                };
+            }
+        } else if (type === 'phone') {
+            const digits = term.replace(/\D/g, '');
+            const cleanPhone = term.replace(/[^0-9+]/g, '');
+            let ukPhone = digits;
+            if (digits.startsWith('44') && digits.length >= 10) {
+                ukPhone = '0' + digits.slice(2);
+            }
+            if (digits.length === 10 && !digits.startsWith('0') && !digits.startsWith('44')) {
+                ukPhone = '0' + digits;
+            }
+            const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
+            const phoneConds = [];
+            for (const p of phoneVariants) {
+                phoneConds.push(
+                    { 'phone.number': p },
+                    { phone: { $elemMatch: { number: { $gte: p, $lt: p + '\uffff' } } } }
+                );
+            }
+            query = {
+                $and: [
+                    { is_blacklisted: { $ne: true } },
+                    { $or: phoneConds }
+                ]
+            };
+        } else if (type === 'url') {
+            const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').toLowerCase();
+            query = {
+                $and: [
+                    { is_blacklisted: { $ne: true } },
+                    {
+                        $or: [
+                            { url: clean },
+                            { url: term },
+                            { url: { $gte: clean, $lt: clean + '\uffff' } }
+                        ]
+                    }
+                ]
+            };
+        } else if (type === 'address') {
+            const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            query = {
+                is_blacklisted: { $ne: true },
+                address_lines: { $regex: escaped, $options: 'i' }
+            };
+        } else {
+            // 'all': multi-field query
+            const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').trim();
+            const cleanLower = clean.toLowerCase();
+            const upperTerm = term.toUpperCase();
+            const normPc = normalizeSearchPostcode(term);
+            const digitCount = (term.match(/\d/g) || []).length;
+            const isPhone = digitCount >= 4 && /^[\d\s+()-]+$/.test(term.trim());
+
+            const conditions = [];
+
+            // Company Name
+            conditions.push(
+                { company_name: term },
+                { company_name: upperTerm },
+                { company_name: { $gte: term, $lt: term + '\uffff' } },
+                { company_name: { $gte: upperTerm, $lt: upperTerm + '\uffff' } }
+            );
+
+            // Postcode
+            if (normPc && normPc.length >= 2) {
+                conditions.push(
+                    { postcode: normPc },
+                    { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                );
+            }
+
+            // URL
+            if (cleanLower.includes('.') || term.includes('/')) {
+                conditions.push(
+                    { url: cleanLower },
+                    { url: { $gte: cleanLower, $lt: cleanLower + '\uffff' } }
+                );
+            }
+
+            // Phone
+            if (isPhone) {
+                const digits = term.replace(/\D/g, '');
+                const cleanPhone = term.replace(/[^0-9+]/g, '');
+                let ukPhone = digits;
+                if (digits.startsWith('44') && digits.length >= 10) {
+                    ukPhone = '0' + digits.slice(2);
+                }
+                if (digits.length === 10 && !digits.startsWith('0') && !digits.startsWith('44')) {
+                    ukPhone = '0' + digits;
+                }
+                const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
+                for (const p of phoneVariants) {
+                    conditions.push(
+                        { 'phone.number': p },
+                        { phone: { $elemMatch: { number: { $gte: p, $lt: p + '\uffff' } } } }
+                    );
+                }
+            }
+
+            query = {
+                $and: [
+                    { is_blacklisted: { $ne: true } },
+                    { $or: conditions }
+                ]
+            };
+        }
+
+        if (cursor && mongoose.isValidObjectId(cursor)) {
+            query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
+        }
+
+        const projection = {
+            company_name: 1,
+            postcode: 1,
+            address_lines: 1,
+            phone: 1,
+            url: 1,
+            raw_date_text: 1,
+            date: 1,
+            _id: 1
+        };
+
+        const cursorRows = await ThompsonImport
+            .find(query, projection)
+            .sort({ _id: 1 })
+            .limit(lim + 1)
+            .maxTimeMS(MAX_TIME_MS)
+            .lean();
+
+        const hasNextPage = cursorRows.length > lim;
+        const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
+        const data = rows.map(formatThompson);
+        const nextCursor = hasNextPage && rows[rows.length - 1] ? String(rows[rows.length - 1]._id) : null;
+
+        return res.json({
+            success: true,
+            db: 'thompson_import',
+            count: data.length,
+            data,
+            cursor: nextCursor,
+            usage: usageBlock(req),
+        });
+    } catch (err) {
+        console.error('[searchThompson]', err.message);
+        if (err.message && (err.message.includes('exceeded time limit') || err.message.includes('buffering timed out'))) {
+            return res.status(504).json({
+                success: false,
+                error: 'Search timed out. Try refining your search query or selecting a specific field.',
+            });
+        }
+        return res.status(500).json({ success: false, error: err.message });
+    }
+};
+
+// ── 9. Usage stats ─────────────────────────────────────────────────────────
 
 const getUsage = async (req, res) => {
     try {
@@ -1153,5 +1392,6 @@ module.exports = {
     searchSocialScrape,
     searchBusiness,
     searchWebsites,
+    searchThompson,
     getUsage
 };
