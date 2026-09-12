@@ -16,9 +16,8 @@ const {
     searchCompany,
     searchScreenshot,
     searchSocialScrape,
-    searchBusiness,
+    // searchBusiness, // Dropped - will use LocatedBusiness
     searchWebsites,
-    searchThompson,
     getUsage,
 } = require('../controllers/SearchController');
 
@@ -31,11 +30,9 @@ router.get('/prop-price',         ...guard, searchPropPrice);
 router.get('/company',            ...guard, searchCompany);
 router.get('/screenshot',         ...guard, searchScreenshot);
 router.get('/social',             ...guard, searchSocialScrape);
-router.get('/business',           ...guard, searchBusiness);
+// router.get('/business',        ...guard, searchBusiness); // Dropped - will use LocatedBusiness
 router.get('/websites',           ...guard, searchWebsites);
 router.get('/website',            ...guard, searchWebsites);
-router.get('/thompson',           ...guard, searchThompson);
-router.get('/thompson-directory', ...guard, searchThompson);
 
 // Usage stats — no rate-limit hit, just needs auth
 router.get('/usage', verifyToken, getUsage);

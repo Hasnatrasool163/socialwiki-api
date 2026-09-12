@@ -51,5 +51,7 @@ locatedBusinessSchema.index(
   { name: 'idx_located_search_text', background: true }
 );
 
+locatedBusinessSchema.index({ company_name: 1, postcode: 1 }, { background: true, unique: true });
+
 const LocatedBusiness = mongoose.models.LocatedBusiness || mongoose.model('LocatedBusiness', locatedBusinessSchema);
 module.exports = LocatedBusiness;
