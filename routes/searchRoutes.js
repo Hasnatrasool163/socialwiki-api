@@ -16,7 +16,7 @@ const {
     searchCompany,
     searchScreenshot,
     searchSocialScrape,
-    // searchBusiness, // Dropped - will use LocatedBusiness
+    searchBusiness,
     searchWebsites,
     getUsage,
 } = require('../controllers/SearchController');
@@ -30,7 +30,9 @@ router.get('/prop-price',         ...guard, searchPropPrice);
 router.get('/company',            ...guard, searchCompany);
 router.get('/screenshot',         ...guard, searchScreenshot);
 router.get('/social',             ...guard, searchSocialScrape);
-// router.get('/business',        ...guard, searchBusiness); // Dropped - will use LocatedBusiness
+router.get('/business',           ...guard, searchBusiness);
+router.get('/businesses',         ...guard, searchBusiness);
+router.get('/located-business',   ...guard, searchBusiness);
 router.get('/websites',           ...guard, searchWebsites);
 router.get('/website',            ...guard, searchWebsites);
 

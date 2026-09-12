@@ -15,7 +15,7 @@ const AddressMasterMerged = require('../models/AddressMasterMerged');
 const PropPrice           = require('../models/PropPrice');
 const ScreenshotUrl       = require('../models/ScreenshotUrl');
 const SocialScrape        = require('../models/SocialScrape');
-// const FoundBusiness       = require('../models/FoundBusiness'); // Dropped - will use LocatedBusiness
+const LocatedBusiness     = require('../models/LocatedBusiness');
 const WebsitePostcode     = require('../models/WebsitePostcode');
 const ChData = mongoose.models.ChData ||
     mongoose.model('ChData', new mongoose.Schema({}, {
@@ -826,18 +826,49 @@ const searchSocialScrape = async (req, res) => {
     }
 };
 
-// ── 6. Business search (found_business_corrected: DROPPED / COMMENTED OUT) ──
-// Will be replaced by LocatedBusiness (located_businesses) search
-/*
-function formatBusiness(d) {
+// ── 6. Business search (located_businesses: 2.49M docs) ─────────────────────
+
+function formatLocatedBusiness(d) {
+    let phones = [];
+    if (Array.isArray(d.phone)) {
+        phones = d.phone.map(p => {
+            if (!p) return '';
+            if (typeof p === 'string') return p;
+            return p.number || '';
+        }).filter(Boolean);
+    } else if (d.phone) {
+        phones = [String(d.phone)];
+    }
+
+    let addressStr = d.address || '';
+    if (!addressStr && Array.isArray(d.address_lines)) {
+        addressStr = d.address_lines.filter(Boolean).join(', ');
+    }
+
+    let dateStr = d.raw_date_text || '';
+    if (!dateStr && d.date_recorded) {
+        try {
+            dateStr = new Date(d.date_recorded).toLocaleDateString('en-GB');
+        } catch {
+            dateStr = '';
+        }
+    }
+
     return {
         _id: d._id,
-        title: d.title || null,
-        address: d.address || null,
+        company_name: d.company_name || null,
+        title: d.company_name || null,
+        address: addressStr || null,
+        address_lines: Array.isArray(d.address_lines) ? d.address_lines : null,
         postcode: d.postcode || null,
-        phone: d.phone || null,
+        phone: phones,
+        email: d.email || null,
         url: d.url || null,
-        date: d.date || null
+        twitter: d.twitter || null,
+        facebook: d.facebook || null,
+        instagram: d.instagram || null,
+        linkedin: d.linkedin || null,
+        date: dateStr || null
     };
 }
 
@@ -853,12 +884,16 @@ const searchBusiness = async (req, res) => {
         let query = {};
 
         if (type === 'name') {
+            const upperTerm = term.toUpperCase();
+            const titleCaseTerm = term.replace(/\b[a-z]/g, c => c.toUpperCase());
             query = {
                 $or: [
-                    { title: term },
-                    { title: term.toUpperCase() },
-                    { title: { $gte: term, $lt: term + '\uffff' } },
-                    { title: { $gte: term.toUpperCase(), $lt: term.toUpperCase() + '\uffff' } }
+                    { company_name: term },
+                    { company_name: upperTerm },
+                    { company_name: titleCaseTerm },
+                    { company_name: { $gte: term, $lt: term + '\uffff' } },
+                    { company_name: { $gte: upperTerm, $lt: upperTerm + '\uffff' } },
+                    { company_name: { $gte: titleCaseTerm, $lt: titleCaseTerm + '\uffff' } }
                 ]
             };
         } else if (type === 'postcode') {
@@ -888,59 +923,57 @@ const searchBusiness = async (req, res) => {
             const phoneConds = [];
             for (const p of phoneVariants) {
                 phoneConds.push(
-                    { phone: p },
-                    { phone: { $gte: p, $lt: p + '\uffff' } }
+                    { 'phone.number': p },
+                    { phone: { $elemMatch: { number: { $gte: p, $lt: p + '\uffff' } } } }
                 );
             }
             query = { $or: phoneConds };
+        } else if (type === 'email') {
+            const cleanEmail = term.toLowerCase();
+            query = {
+                $or: [
+                    { email: cleanEmail },
+                    { email: { $gte: cleanEmail, $lt: cleanEmail + '\uffff' } }
+                ]
+            };
         } else if (type === 'url') {
             const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').toLowerCase();
             query = {
                 $or: [
                     { url: clean },
-                    { url: term },
+                    { url: term.toLowerCase() },
                     { url: { $gte: clean, $lt: clean + '\uffff' } }
                 ]
             };
         } else if (type === 'address') {
             const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            query = { address: { $regex: escaped, $options: 'i' } };
+            query = {
+                $or: [
+                    { address: { $regex: escaped, $options: 'i' } },
+                    { address_lines: { $regex: escaped, $options: 'i' } }
+                ]
+            };
         } else {
-            // 'all': multi-field query
+            // 'all': dynamic multi-field query (all branches mapped to the 7 indexed fields)
             const clean = term.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '').trim();
             const cleanLower = clean.toLowerCase();
             const upperTerm = term.toUpperCase();
             const normPc = normalizeSearchPostcode(term);
             const digitCount = (term.match(/\d/g) || []).length;
             const isPhone = digitCount >= 4 && /^[\d\s+()-]+$/.test(term.trim());
+            const isEmail = term.includes('@');
 
             const conditions = [];
 
-            // Title / Name
-            conditions.push(
-                { title: term },
-                { title: upperTerm },
-                { title: { $gte: term, $lt: term + '\uffff' } },
-                { title: { $gte: upperTerm, $lt: upperTerm + '\uffff' } }
-            );
-
-            // Postcode
-            if (normPc && normPc.length >= 2) {
+            // 1. Email (hits email_1)
+            if (isEmail) {
                 conditions.push(
-                    { postcode: normPc },
-                    { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                    { email: cleanLower },
+                    { email: { $gte: cleanLower, $lt: cleanLower + '\uffff' } }
                 );
             }
 
-            // URL
-            if (cleanLower.includes('.') || term.includes('/')) {
-                conditions.push(
-                    { url: cleanLower },
-                    { url: { $gte: cleanLower, $lt: cleanLower + '\uffff' } }
-                );
-            }
-
-            // Phone
+            // 2. Phone (hits phone.number_1)
             if (isPhone) {
                 const digits = term.replace(/\D/g, '');
                 const cleanPhone = term.replace(/[^0-9+]/g, '');
@@ -954,30 +987,66 @@ const searchBusiness = async (req, res) => {
                 const phoneVariants = [...new Set([cleanPhone, term, digits, ukPhone].filter(p => p && p.length >= 2))];
                 for (const p of phoneVariants) {
                     conditions.push(
-                        { phone: p },
-                        { phone: { $gte: p, $lt: p + '\uffff' } }
+                        { 'phone.number': p },
+                        { phone: { $elemMatch: { number: { $gte: p, $lt: p + '\uffff' } } } }
                     );
                 }
             }
 
+            // 3. Postcode (hits postcode_1)
+            if (normPc && normPc.length >= 2 && (/\d/.test(normPc) || normPc.length <= 4)) {
+                conditions.push(
+                    { postcode: normPc },
+                    { postcode: { $gte: normPc, $lt: normPc + '\uffff' } }
+                );
+            }
+
+            // 4. URL (hits url_1)
+            if (cleanLower.includes('.') || term.includes('/') || term.startsWith('www')) {
+                conditions.push(
+                    { url: cleanLower },
+                    { url: { $gte: cleanLower, $lt: cleanLower + '\uffff' } }
+                );
+            }
+
+            // 5. Company Name (hits company_name_1_postcode_1 index)
+            const titleCaseTerm = term.replace(/\b[a-z]/g, c => c.toUpperCase());
+            conditions.push(
+                { company_name: term },
+                { company_name: upperTerm },
+                { company_name: titleCaseTerm },
+                { company_name: { $gte: term, $lt: term + '\uffff' } },
+                { company_name: { $gte: upperTerm, $lt: upperTerm + '\uffff' } },
+                { company_name: { $gte: titleCaseTerm, $lt: titleCaseTerm + '\uffff' } }
+            );
+
             query = { $or: conditions };
         }
+
+        query.is_blacklisted = { $ne: true };
 
         if (cursor && mongoose.isValidObjectId(cursor)) {
             query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
         }
 
         const projection = {
-            title: 1,
+            company_name: 1,
             postcode: 1,
             address: 1,
+            address_lines: 1,
             phone: 1,
+            email: 1,
             url: 1,
-            date: 1,
+            twitter: 1,
+            facebook: 1,
+            instagram: 1,
+            linkedin: 1,
+            date_recorded: 1,
+            raw_date_text: 1,
             _id: 1
         };
 
-        const cursorRows = await FoundBusiness
+        const cursorRows = await LocatedBusiness
             .find(query, projection)
             .sort({ _id: 1 })
             .limit(lim + 1)
@@ -986,12 +1055,12 @@ const searchBusiness = async (req, res) => {
 
         const hasNextPage = cursorRows.length > lim;
         const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
-        const data = rows.map(formatBusiness);
+        const data = rows.map(formatLocatedBusiness);
         const nextCursor = hasNextPage && rows[rows.length - 1] ? String(rows[rows.length - 1]._id) : null;
 
         return res.json({
             success: true,
-            db: 'found_business_corrected',
+            db: 'located_businesses',
             count: data.length,
             data,
             cursor: nextCursor,
@@ -1008,7 +1077,6 @@ const searchBusiness = async (req, res) => {
         return res.status(500).json({ success: false, error: err.message });
     }
 };
-*/
 
 // ── 7. Websites search (website_postcode: 689k docs) ───────────────────────
 
@@ -1153,6 +1221,7 @@ module.exports = {
     searchCompany,
     searchScreenshot,
     searchSocialScrape,
+    searchBusiness,
     searchWebsites,
     getUsage
 };
