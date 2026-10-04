@@ -12,11 +12,11 @@ const mongoose = require('mongoose');
 
 // Models
 const AddressMasterMerged = require('../models/AddressMasterMerged');
-const PropPrice           = require('../models/PropPrice');
-const ScreenshotUrl       = require('../models/ScreenshotUrl');
-const SocialScrape        = require('../models/SocialScrape');
-const LocatedBusiness     = require('../models/LocatedBusiness');
-const WebsitePostcode     = require('../models/WebsitePostcode');
+const PropPrice = require('../models/PropPrice');
+const ScreenshotUrl = require('../models/ScreenshotUrl');
+const SocialScrape = require('../models/SocialScrape');
+const LocatedBusiness = require('../models/LocatedBusiness');
+const WebsitePostcode = require('../models/WebsitePostcode');
 const ChData = mongoose.models.ChData ||
     mongoose.model('ChData', new mongoose.Schema({}, {
         strict: false,
@@ -25,7 +25,7 @@ const ChData = mongoose.models.ChData ||
     }));
 
 const SEARCH_LIMIT = 50;
-const MAX_TIME_MS  = 10000; // 10s timeout guard
+const MAX_TIME_MS = 10000; // 10s timeout guard
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -66,6 +66,134 @@ function decodeCursorToken(cursor) {
 function usageBlock(req) {
     return req.searchUsage || null;
 }
+
+const searchCache = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
+const norm = s => s.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[’'`]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const nextPrefix = p => p.slice(0, -1) + String.fromCharCode(p.charCodeAt(p.length - 1) + 1);
+const isPostcode = q => /^[a-z]{1,2}\d[a-z\d]?( ?\d[a-z]{0,2})?$/.test(q);
+
+// ==========================================
+// 1. AUTOCOMPLETE DROPDOWN (Slim payload, no postcodes array)
+// ==========================================
+const suggestRmAddress = async (req, res) => {
+    try {
+        const qRaw = req.query.q || '';
+        const q = norm(qRaw);
+
+        if (q.length < 3) return res.json([]);
+        if (searchCache.has(q)) return res.json(searchCache.get(q));
+
+        const db = req.app.locals.db || require('mongoose').connection.db; 
+        const dictColl = db.collection('search_dictionary');
+        let results = [];
+        
+        const projection = { display: 1, type: 1 }; 
+
+        if (isPostcode(q)) {
+            const compactQuery = q.replace(/\s+/g, '');
+            results = await dictColl.find({
+                type: 'postcode',
+                compact: { $gte: compactQuery,$lt: nextPrefix(compactQuery) }
+            }).sort({ key: 1 }).limit(10).project(projection).toArray();
+        } else {
+            let searchStr = q;
+            const leadingNumberMatch = q.match(/^(\d+[a-z]?)\s+(.*)/);
+            let leadingNumber = null;
+            if (leadingNumberMatch) {
+                leadingNumber = leadingNumberMatch[1];
+                searchStr = leadingNumberMatch[2];
+            }
+
+            results = await dictColl.find({
+                type: { $in: ['street', 'locality', 'building'] },
+                key: { $gte: searchStr,$lt: nextPrefix(searchStr) }
+            }).sort({ key: 1 }).limit(10).maxTimeMS(300).project(projection).toArray();
+
+            if (results.length < 10) {
+                const words = searchStr.split(' ');
+                const last = words.pop();
+                if (last) {
+                    const tokenConditions = words.map(w => ({ tokens: w }));
+                    tokenConditions.push({ tokens: { $gte: last,$lt: nextPrefix(last) } });
+
+                    const tokenResults = await dictColl.find({
+                        type: { $in: ['street', 'building'] },$and: tokenConditions
+                    }).limit(10 - results.length).maxTimeMS(300).project(projection).toArray();
+
+                    const seen = new Set(results.map(r => String(r._id)));
+                    tokenResults.forEach(r => {
+                        if (!seen.has(String(r._id))) results.push(r);
+                    });
+                }
+            }
+            if (leadingNumber) results = results.map(r => ({ ...r, requestedNumber: leadingNumber }));
+        }
+
+        const safePayload = results.map(r => ({
+            id: String(r._id),
+            display: r.display,
+            type: r.type,
+            requestedNumber: r.requestedNumber || null
+        }));
+
+        searchCache.set(q, safePayload);
+        res.json(safePayload);
+
+    } catch (error) {
+        console.error('[suggestRmAddress]', error.message);
+        res.status(500).json([]);
+    }
+};
+
+// ==========================================
+// 2. THE CASCADE (User selects a dropdown item)
+// ==========================================
+const cascadeRmAddress = async (req, res) => {
+    try {
+        const { id, requestedNumber } = req.query; // Send as query params to match your frontend fetch style
+        if (!id) return res.status(400).json({ success: false, message: 'Missing Dictionary ID' });
+
+        const db = req.app.locals.db || require('mongoose').connection.db; 
+        const dictColl = db.collection('search_dictionary');
+        const mainColl = db.collection('address_master_merged');
+
+        const dictDoc = await dictColl.findOne({ _id: new ObjectId(id) });
+        if (!dictDoc || !dictDoc.postcodes) return res.json({ success: true, count: 0, data: [] });
+
+        const andFilters = [{ postcode: { $in: dictDoc.postcodes } }];
+
+        if (dictDoc.street) {
+            andFilters.push({ address: { $regex: `(^|[\\s,])${esc(dictDoc.street)}$`, $options: 'i' } });
+        }
+
+        if (requestedNumber && /^\d+[a-z]?$/i.test(requestedNumber)) {
+            andFilters.push({ address: { $regex: `(^|,\\s*)(flat\\s+)?${esc(requestedNumber)}\\b`, $options: 'i' } });
+        }
+
+        const addresses = await mainColl.find({ $and: andFilters }, { projection: { postcode: 1, district: 1, address: 1 } })
+            .sort({ postcode: 1, address: 1 })
+            .limit(500)
+            .maxTimeMS(2000)
+            .toArray();
+
+        // Natural sort
+        addresses.sort((a, b) => a.address.localeCompare(b.address, undefined, { numeric: true, sensitivity: 'base' }));
+
+        return res.json({
+            success: true,
+            db: 'rm_address',
+            count: addresses.length,
+            data: addresses,
+            cursor: null, // Pagination not needed for strict street lookups yet
+            usage: req.usageBlock ? req.usageBlock : null, // Assuming your usage block middleware sets this
+        });
+
+    } catch (error) {
+        console.error('[cascadeRmAddress]', error.message);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+};
 
 // ── 1. RM Address search (address_master_merged: 36M+ docs) ────────────────
 
@@ -279,15 +407,15 @@ const searchPropPrice = async (req, res) => {
             db: 'prop_price',
             count: data.length,
             data: data.map(d => ({
-                address:       d.address_display,
-                postcode:      d.postcode,
-                price:         d.price_paid,
-                date:          d.deed_date ? new Date(d.deed_date).toLocaleDateString('en-GB') : null,
+                address: d.address_display,
+                postcode: d.postcode,
+                price: d.price_paid,
+                date: d.deed_date ? new Date(d.deed_date).toLocaleDateString('en-GB') : null,
                 property_type: d.property_type,
-                new_build:     d.new_build,
-                town:          d.town,
-                district:      d.district,
-                county:        d.county,
+                new_build: d.new_build,
+                town: d.town,
+                district: d.district,
+                county: d.county,
             })),
             cursor: nextCursor,
             usage: usageBlock(req),
@@ -414,16 +542,16 @@ const searchCompany = async (req, res) => {
 function formatCompany(d) {
     const line1 = d['RegAddress.AddressLine1'] || d.RegAddress?.AddressLine1 || d.AddressLine1 || '';
     const line2 = d['RegAddress.AddressLine2'] || d.RegAddress?.AddressLine2 || d.AddressLine2 || '';
-    const town  = d['RegAddress.PostTown']     || d.RegAddress?.PostTown     || d.PostTown     || '';
-    const pc    = d['RegAddress.PostCode']     || d.RegAddress?.PostCode     || d.PostCode     || '';
+    const town = d['RegAddress.PostTown'] || d.RegAddress?.PostTown || d.PostTown || '';
+    const pc = d['RegAddress.PostCode'] || d.RegAddress?.PostCode || d.PostCode || '';
 
     const parts = [line1, line2, town, pc].filter(Boolean);
 
     return {
-        name:         d.CompanyName,
-        number:       d.CompanyNumber,
-        address:      parts.length > 0 ? parts.join(', ') : null,
-        status:       d.CompanyStatus,
+        name: d.CompanyName,
+        number: d.CompanyNumber,
+        address: parts.length > 0 ? parts.join(', ') : null,
+        status: d.CompanyStatus,
         incorporated: d.IncorporationDate,
     };
 }
@@ -641,14 +769,14 @@ const searchSocialScrape = async (req, res) => {
 
             query = {
                 $or: [
-                    { facebook:  { $in: socialSearchTerms } },
-                    { twitter:   { $in: socialSearchTerms } },
+                    { facebook: { $in: socialSearchTerms } },
+                    { twitter: { $in: socialSearchTerms } },
                     { instagram: { $in: socialSearchTerms } },
-                    { linkedin:  { $in: socialSearchTerms } },
+                    { linkedin: { $in: socialSearchTerms } },
                     { pinterest: { $in: socialSearchTerms } },
-                    { youtube:   { $in: socialSearchTerms } },
-                    { facebook:  { $gte: `facebook.com/${cleanHandle}`,  $lt: `facebook.com/${cleanHandle}\uffff` } },
-                    { twitter:   { $gte: `twitter.com/${cleanHandle}`,   $lt: `twitter.com/${cleanHandle}\uffff` } },
+                    { youtube: { $in: socialSearchTerms } },
+                    { facebook: { $gte: `facebook.com/${cleanHandle}`, $lt: `facebook.com/${cleanHandle}\uffff` } },
+                    { twitter: { $gte: `twitter.com/${cleanHandle}`, $lt: `twitter.com/${cleanHandle}\uffff` } },
                     { instagram: { $gte: `instagram.com/${cleanHandle}`, $lt: `instagram.com/${cleanHandle}\uffff` } }
                 ]
             };
@@ -731,14 +859,14 @@ const searchSocialScrape = async (req, res) => {
             ].filter(Boolean))];
 
             conditions.push(
-                { facebook:  { $in: socialSearchTerms } },
-                { twitter:   { $in: socialSearchTerms } },
+                { facebook: { $in: socialSearchTerms } },
+                { twitter: { $in: socialSearchTerms } },
                 { instagram: { $in: socialSearchTerms } },
-                { linkedin:  { $in: socialSearchTerms } },
+                { linkedin: { $in: socialSearchTerms } },
                 { pinterest: { $in: socialSearchTerms } },
-                { youtube:   { $in: socialSearchTerms } },
-                { facebook:  { $gte: `facebook.com/${cleanHandle}`,  $lt: `facebook.com/${cleanHandle}\uffff` } },
-                { twitter:   { $gte: `twitter.com/${cleanHandle}`,   $lt: `twitter.com/${cleanHandle}\uffff` } },
+                { youtube: { $in: socialSearchTerms } },
+                { facebook: { $gte: `facebook.com/${cleanHandle}`, $lt: `facebook.com/${cleanHandle}\uffff` } },
+                { twitter: { $gte: `twitter.com/${cleanHandle}`, $lt: `twitter.com/${cleanHandle}\uffff` } },
                 { instagram: { $gte: `instagram.com/${cleanHandle}`, $lt: `instagram.com/${cleanHandle}\uffff` } }
             );
 
@@ -1204,11 +1332,11 @@ const getUsage = async (req, res) => {
 
         return res.json({
             success: true,
-            plan:      user.plan,
-            used:      user.searchCount || 0,
+            plan: user.plan,
+            used: user.searchCount || 0,
             limit,
             remaining: limit === null ? null : Math.max(0, limit - (user.searchCount || 0)),
-            resetAt:   midnight.toISOString(),
+            resetAt: midnight.toISOString(),
         });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
@@ -1216,6 +1344,8 @@ const getUsage = async (req, res) => {
 };
 
 module.exports = {
+    suggestRmAddress,
+    cascadeRmAddress,
     searchRmAddress,
     searchPropPrice,
     searchCompany,
