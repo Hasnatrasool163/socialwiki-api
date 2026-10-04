@@ -216,7 +216,7 @@ const cascadeRmAddress = async (req, res) => {
             more: hasExact ? rest : [],         // "More Addresses" divider
             truncated: truncated,
             count: (hasExact ? exact.length : 0) + rest.length,
-            usage: req.usageBlock ? req.usageBlock : null,
+            usage: usageBlock(req),
         });
 
     } catch (error) {
