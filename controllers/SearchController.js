@@ -74,6 +74,20 @@ const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const nextPrefix = p => p.slice(0, -1) + String.fromCharCode(p.charCodeAt(p.length - 1) + 1);
 const isPostcode = q => /^[a-z]{1,2}\d[a-z\d]?( ?\d[a-z]{0,2})?$/.test(q);
 
+const UNIT = 'flat|unit|room|apartment|apt|suite';
+const UNIT_ID = '(\\d+[a-z]?|[a-z]\\d*)'; // matches 2, 7r, a, e16
+
+function parseQuery(q) {
+    let rest = q, unit = null, num = null, m;
+    if ((m = rest.match(new RegExp(`^(?:${UNIT})\\s+${UNIT_ID}\\s+(.+)$`)))) { 
+        unit = m[1]; rest = m[2]; 
+    }
+    if ((m = rest.match(/^(\d+[a-z]?)(?:\s+\d+[a-z]?)?\s+(.+)$/))) { 
+        num = m[1]; rest = m[2]; 
+    }
+    return { unit, num, rest }; 
+}
+
 // ==========================================
 // 1. AUTOCOMPLETE DROPDOWN (Slim payload, no postcodes array)
 // ==========================================
@@ -81,46 +95,43 @@ const suggestRmAddress = async (req, res) => {
     try {
         const qRaw = req.query.q || '';
         const q = norm(qRaw);
+        const { unit, num, rest } = parseQuery(q);
 
-        if (q.length < 3) return res.json([]);
-        if (searchCache.has(q)) return res.json(searchCache.get(q));
+        if (rest.length < 3) return res.json([]);
+
+        // Check cache for the stripped street name
+        if (searchCache.has(rest)) {
+            const cached = searchCache.get(rest);
+            return res.json(cached.map(r => ({ ...r, requestedUnit: unit, requestedNumber: num })));
+        }
 
         const db = req.app.locals.db || require('mongoose').connection.db; 
         const dictColl = db.collection('search_dictionary');
         let results = [];
-        
         const projection = { display: 1, type: 1 }; 
 
-        if (isPostcode(q)) {
-            const compactQuery = q.replace(/\s+/g, '');
+        if (isPostcode(rest)) {
+            const compactQuery = rest.replace(/\s+/g, '');
             results = await dictColl.find({
                 type: 'postcode',
                 compact: { $gte: compactQuery, $lt: nextPrefix(compactQuery) }
             }).sort({ compact: 1 }).limit(10).project(projection).toArray();
-        }
-         else {
-            let searchStr = q;
-            const leadingNumberMatch = q.match(/^(\d+[a-z]?)\s+(.*)/);
-            let leadingNumber = null;
-            if (leadingNumberMatch) {
-                leadingNumber = leadingNumberMatch[1];
-                searchStr = leadingNumberMatch[2];
-            }
-
+        } else {
             results = await dictColl.find({
                 type: { $in: ['street', 'locality', 'building'] },
-                key: { $gte: searchStr,$lt: nextPrefix(searchStr) }
+                key: { $gte: rest, $lt: nextPrefix(rest) }
             }).sort({ key: 1 }).limit(10).maxTimeMS(300).project(projection).toArray();
 
             if (results.length < 10) {
-                const words = searchStr.split(' ');
+                const words = rest.split(' ');
                 const last = words.pop();
                 if (last) {
                     const tokenConditions = words.map(w => ({ tokens: w }));
-                    tokenConditions.push({ tokens: { $gte: last,$lt: nextPrefix(last) } });
+                    tokenConditions.push({ tokens: { $gte: last, $lt: nextPrefix(last) } });
 
                     const tokenResults = await dictColl.find({
-                        type: { $in: ['street', 'building'] },$and: tokenConditions
+                        type: { $in: ['street', 'building'] },
+                        $and: tokenConditions
                     }).limit(10 - results.length).maxTimeMS(300).project(projection).toArray();
 
                     const seen = new Set(results.map(r => String(r._id)));
@@ -129,18 +140,18 @@ const suggestRmAddress = async (req, res) => {
                     });
                 }
             }
-            if (leadingNumber) results = results.map(r => ({ ...r, requestedNumber: leadingNumber }));
         }
 
+        // Cache the slim payload (without numbers)
         const safePayload = results.map(r => ({
             id: String(r._id),
             display: r.display,
-            type: r.type,
-            requestedNumber: r.requestedNumber || null
+            type: r.type
         }));
+        searchCache.set(rest, safePayload);
 
-        searchCache.set(q, safePayload);
-        res.json(safePayload);
+        // Map numbers back onto the response for this specific user request
+        res.json(safePayload.map(r => ({ ...r, requestedUnit: unit, requestedNumber: num })));
 
     } catch (error) {
         console.error('[suggestRmAddress]', error.message);
@@ -266,46 +277,96 @@ const searchRmAddress = async (req, res) => {
                 }
             }
         } else {
-            // Try full-text search on address if text index exists
-            try {
-                const textQuery = { $text: { $search: term } };
-                if (cursor && mongoose.isValidObjectId(cursor)) {
-                    textQuery._id = { $gt: new mongoose.Types.ObjectId(cursor) };
-                }
-
-                const cursorRows = await AddressMasterMerged
-                    .find(textQuery, {
-                        postcode: 1, district: 1, address: 1, _id: 1,
-                        score: { $meta: 'textScore' }
-                    })
-                    .sort({ score: { $meta: 'textScore' }, _id: 1 })
-                    .limit(lim + 1)
-                    .maxTimeMS(MAX_TIME_MS)
-                    .lean();
-
-                const hasNextPage = cursorRows.length > lim;
-                const rows = hasNextPage ? cursorRows.slice(0, lim) : cursorRows;
-                const data = rows.sort((a, b) => naturalCompare(a.address, b.address));
-                const nextCursor = hasNextPage && rows[rows.length - 1] ? String(rows[rows.length - 1]._id) : null;
-
-                return res.json({
-                    success: true,
-                    db: 'rm_address',
-                    count: data.length,
-                    data: data.map(d => ({ postcode: d.postcode, district: d.district, address: d.address })),
-                    cursor: nextCursor,
-                    usage: usageBlock(req),
-                });
-            } catch (textErr) {
-                // Text index not present — fall back to regex scan
-                const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                query.address = { $regex: escaped, $options: 'i' };
-
-                if (cursor && mongoose.isValidObjectId(cursor)) {
-                    query._id = { $gt: new mongoose.Types.ObjectId(cursor) };
-                }
-                sortStage = { _id: 1 };
+            // 1. Parse the text using our new helper
+            const { unit, num, rest } = parseQuery(norm(term));
+            if (rest.length < 3) {
+                return res.json({ success: true, count: 0, data: [], message: 'Query too short.', usage: usageBlock(req) });
             }
+
+            const db = req.app.locals.db || mongoose.connection.db; 
+            const dictColl = db.collection('search_dictionary');
+            const mainColl = db.collection('address_master_merged');
+
+            // 2. Find the single best match in the Dictionary
+            let dictDoc = await dictColl.findOne({
+                type: { $in: ['street', 'locality', 'building'] },
+                key: { $gte: rest,$lt: nextPrefix(rest) }
+            }, { sort: { key: 1 } });
+
+            // Token Fallback (if prefix fails)
+            if (!dictDoc) {
+                const words = rest.split(' ');
+                const last = words.pop();
+                if (last) {
+                    const tokenConditions = words.map(w => ({ tokens: w }));
+                    tokenConditions.push({ tokens: { $gte: last,$lt: nextPrefix(last) } });
+                    dictDoc = await dictColl.findOne({
+                        type: { $in: ['street', 'building'] },$and: tokenConditions
+                    });
+                }
+            }
+
+            // 3. If nothing matches, fail instantly and gracefully
+            if (!dictDoc || !dictDoc.postcodes || dictDoc.postcodes.length === 0) {
+                return res.json({
+                    success: true, db: 'rm_address', count: 0, data: [], 
+                    message: 'No matching addresses found.', usage: usageBlock(req)
+                });
+            }
+
+            // 4. Run the exact same ultra-fast Cascade logic!
+            const proj = { projection: { postcode: 1, district: 1, address: 1 } };
+            const base = [{ postcode: { $in: dictDoc.postcodes } }];
+            if (dictDoc.street) {
+                base.push({ address: { $regex: `(^|[\\s,])${esc(dictDoc.street)}$`, $options: 'i' } });
+            }
+
+            const extras = [];
+            if (unit) extras.push({ address: { $regex: `(^|,\\s*)(${UNIT})\\s+${esc(unit)}\\b`, $options: 'i' } });
+            if (num)  extras.push({ address: { $regex: `(^|,\\s*)${unit ? '' : `((${UNIT})\\s+)?`}${esc(num)}[a-z]?\\b`, $options: 'i' } });
+
+            const find = (ex, lim) => mainColl.find({ $and: [...base, ...ex] }, proj)
+                .sort({ postcode: 1, address: 1 }).limit(lim).maxTimeMS(2000).toArray();
+
+            const [exact, street] = await Promise.all([ extras.length ? find(extras, 100) : [], find([], 501) ]);
+
+            const truncated = street.length > 500;
+            const exactIds = new Set(exact.map(r => String(r._id)));
+            const restRows = street.slice(0, 500).filter(r => !exactIds.has(String(r._id)));
+
+            const houseKey = a => {
+                for (const p of a.split(',')) {
+                    const m = p.trim().match(/^(\d+)([a-z]?)\b/i);
+                    if (m) return [parseInt(m[1], 10), m[2].toLowerCase()];
+                }
+                return [Infinity, ''];
+            };
+            const byHouse = (a, b) => {
+                const [an, al] = houseKey(a.address), [bn, bl] = houseKey(b.address);
+                return (an - bn) || al.localeCompare(bl) || a.address.localeCompare(b.address, undefined, { numeric: true, sensitivity: 'base' });
+            };
+            
+            const rank = r => (num && !unit && houseKey(r.address)[0] === parseInt(num, 10)) ? 0 : 1;
+            exact.sort((a, b) => rank(a) - rank(b) || byHouse(a, b));
+            restRows.sort(byHouse);
+
+            const hasExact = exact.length > 0;
+            const msgStr = [unit && 'flat ' + unit, num].filter(Boolean).join(' ');
+
+            return res.json({
+                success: true,
+                db: 'rm_address',
+                requestedNumber: num,
+                requestedUnit: unit,
+                exactMatch: extras.length ? hasExact : null,
+                message: extras.length && !hasExact ? `No exact match for "${msgStr}". Showing all addresses on this street.` : null,
+                data: hasExact ? exact : restRows,
+                more: hasExact ? restRows : [],
+                truncated: truncated,
+                count: (hasExact ? exact.length : 0) + restRows.length,
+                cursor: null,
+                usage: usageBlock(req),
+            });
         }
 
         const cursorRows = await AddressMasterMerged
