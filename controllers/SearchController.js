@@ -95,9 +95,10 @@ const suggestRmAddress = async (req, res) => {
             const compactQuery = q.replace(/\s+/g, '');
             results = await dictColl.find({
                 type: 'postcode',
-                compact: { $gte: compactQuery,$lt: nextPrefix(compactQuery) }
-            }).sort({ key: 1 }).limit(10).project(projection).toArray();
-        } else {
+                compact: { $gte: compactQuery, $lt: nextPrefix(compactQuery) }
+            }).sort({ compact: 1 }).limit(10).project(projection).toArray();
+        }
+         else {
             let searchStr = q;
             const leadingNumberMatch = q.match(/^(\d+[a-z]?)\s+(.*)/);
             let leadingNumber = null;
@@ -152,43 +153,70 @@ const suggestRmAddress = async (req, res) => {
 // ==========================================
 const cascadeRmAddress = async (req, res) => {
     try {
-        const { id, requestedNumber } = req.query; // Send as query params to match your frontend fetch style
-        if (!id) return res.status(400).json({ success: false, message: 'Missing Dictionary ID' });
-        if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid Dictionary ID' });
+        const { id, requestedNumber } = req.query;
+        if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ success: false, message: 'Invalid Dictionary ID' });
+        }
 
-        const db = req.app.locals.db || require('mongoose').connection.db; 
+        const db = req.app.locals.db || mongoose.connection.db; 
         const dictColl = db.collection('search_dictionary');
         const mainColl = db.collection('address_master_merged');
 
         const dictDoc = await dictColl.findOne({ _id: new mongoose.Types.ObjectId(id) });
-        if (!dictDoc || !dictDoc.postcodes) return res.json({ success: true, count: 0, data: [] });
+        if (!dictDoc || !dictDoc.postcodes || dictDoc.postcodes.length === 0) {
+            return res.json({ success: true, count: 0, data: [], exactMatch: false });
+        }
 
-        const andFilters = [{ postcode: { $in: dictDoc.postcodes } }];
-
+        const proj = { projection: { postcode: 1, district: 1, address: 1 } };
+        const base = [{ postcode: { $in: dictDoc.postcodes } }];
         if (dictDoc.street) {
-            andFilters.push({ address: { $regex: `(^|[\\s,])${esc(dictDoc.street)}$`, $options: 'i' } });
+            base.push({ address: { $regex: `(^|[\\s,])${esc(dictDoc.street)}$`, $options: 'i' } });
         }
 
-        if (requestedNumber && /^\d+[a-z]?$/i.test(requestedNumber)) {
-            andFilters.push({ address: { $regex: `(^|,\\s*)(flat\\s+)?${esc(requestedNumber)}\\b`, $options: 'i' } });
-        }
+        const num = /^\d+[a-z]?$/i.test(requestedNumber || '') ? requestedNumber : null;
+        
+        const find = (extra, lim) => mainColl
+            .find({ $and: extra ? [...base, extra] : base }, proj)
+            .sort({ postcode: 1, address: 1 }).limit(lim).maxTimeMS(2000).toArray();
 
-        const addresses = await mainColl.find({ $and: andFilters }, { projection: { postcode: 1, district: 1, address: 1 } })
-            .sort({ postcode: 1, address: 1 })
-            .limit(500)
-            .maxTimeMS(2000)
-            .toArray();
+        // exact and whole-street queries run in parallel
+        const [exact, street] = await Promise.all([
+            num ? find({ address: { $regex: `(^|,\\s*)${esc(num)}[a-z]?\\b`, $options: 'i' } }, 100) : [],
+            find(null, 501),
+        ]);
 
-        // Natural sort
-        addresses.sort((a, b) => a.address.localeCompare(b.address, undefined, { numeric: true, sensitivity: 'base' }));
+        const truncated = street.length > 500;
+        const exactIds = new Set(exact.map(r => String(r._id)));
+        const rest = street.slice(0, 500).filter(r => !exactIds.has(String(r._id)));
 
+        // sort by parsed house number, not by the whole string
+        const houseKey = a => {
+            for (const p of a.split(',')) {
+                const m = p.trim().match(/^(\d+)([a-z]?)\b/i);
+                if (m) return [parseInt(m[1], 10), m[2].toLowerCase()];
+            }
+            return [Infinity, ''];
+        };
+        const byHouse = (a, b) => {
+            const [an, al] = houseKey(a.address), [bn, bl] = houseKey(b.address);
+            return (an - bn) || al.localeCompare(bl) ||
+                a.address.localeCompare(b.address, undefined, { numeric: true, sensitivity: 'base' });
+        };
+        exact.sort(byHouse); rest.sort(byHouse);
+
+        const hasExact = exact.length > 0;
+        
         return res.json({
-            success: true,
+            success: true, 
             db: 'rm_address',
-            count: addresses.length,
-            data: addresses,
-            cursor: null, // Pagination not needed for strict street lookups yet
-            usage: usageBlock(req),
+            requestedNumber: num,
+            exactMatch: num ? hasExact : null,
+            message: num && !hasExact ? `No exact match for "${num}". Showing all addresses on this street.` : null,
+            data: hasExact ? exact : rest,      // Main table
+            more: hasExact ? rest : [],         // "More Addresses" divider
+            truncated: truncated,
+            count: (hasExact ? exact.length : 0) + rest.length,
+            usage: req.usageBlock ? req.usageBlock : null,
         });
 
     } catch (error) {
@@ -196,7 +224,6 @@ const cascadeRmAddress = async (req, res) => {
         return res.status(500).json({ success: false, error: error.message });
     }
 };
-
 // ── 1. RM Address search (address_master_merged: 36M+ docs) ────────────────
 
 const searchRmAddress = async (req, res) => {
