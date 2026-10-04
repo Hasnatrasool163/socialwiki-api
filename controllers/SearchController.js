@@ -9,6 +9,7 @@
  */
 
 const mongoose = require('mongoose');
+const { ObjectId } = mongoose.Types;
 const { LRUCache } = require('lru-cache');
 // Models
 const AddressMasterMerged = require('../models/AddressMasterMerged');
@@ -153,12 +154,13 @@ const cascadeRmAddress = async (req, res) => {
     try {
         const { id, requestedNumber } = req.query; // Send as query params to match your frontend fetch style
         if (!id) return res.status(400).json({ success: false, message: 'Missing Dictionary ID' });
+        if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ success: false, message: 'Invalid Dictionary ID' });
 
         const db = req.app.locals.db || require('mongoose').connection.db; 
         const dictColl = db.collection('search_dictionary');
         const mainColl = db.collection('address_master_merged');
 
-        const dictDoc = await dictColl.findOne({ _id: new ObjectId(id) });
+        const dictDoc = await dictColl.findOne({ _id: new mongoose.Types.ObjectId(id) });
         if (!dictDoc || !dictDoc.postcodes) return res.json({ success: true, count: 0, data: [] });
 
         const andFilters = [{ postcode: { $in: dictDoc.postcodes } }];
@@ -186,7 +188,7 @@ const cascadeRmAddress = async (req, res) => {
             count: addresses.length,
             data: addresses,
             cursor: null, // Pagination not needed for strict street lookups yet
-            usage: req.usageBlock ? req.usageBlock : null, // Assuming your usage block middleware sets this
+            usage: usageBlock(req),
         });
 
     } catch (error) {
