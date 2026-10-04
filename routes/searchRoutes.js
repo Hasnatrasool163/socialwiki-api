@@ -15,6 +15,8 @@ const botProtect      = require('../middlewares/botProtect');
 const searchRateLimit = require('../middlewares/searchRateLimit');
 const {
     searchRmAddress,
+    suggestRmAddress,  
+    cascadeRmAddress,
     searchPropPrice,
     searchCompany,
     searchScreenshot,
