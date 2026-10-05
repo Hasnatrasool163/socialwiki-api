@@ -108,7 +108,14 @@ const suggestRmAddress = async (req, res) => {
         const db = req.app.locals.db || require('mongoose').connection.db; 
         const dictColl = db.collection('search_dictionary');
         let results = [];
-        const projection = { display: 1, type: 1 }; 
+        const projection = {
+            display: 1,
+            type: 1,
+            street: 1,
+            town: 1,
+            count: 1,
+            postcodes: { $slice: 1 }
+        }; 
 
         if (isPostcode(rest)) {
             const compactQuery = rest.replace(/\s+/g, '');
@@ -143,11 +150,19 @@ const suggestRmAddress = async (req, res) => {
         }
 
         // Cache the slim payload (without numbers)
-        const safePayload = results.map(r => ({
-            id: String(r._id),
-            display: r.display,
-            type: r.type
-        }));
+        const safePayload = results.map(r => {
+            const isPc = r.type === 'postcode';
+            return {
+                id: String(r._id),
+                display: r.display,
+                title: isPc ? r.display : (r.street || r.display),
+                town: r.town || '',
+                postcode: isPc ? '' : (r.postcodes?.[0] || ''),
+                count: r.count || null,
+                more: r.type === 'street',
+                type: r.type
+            };
+        });
         searchCache.set(rest, safePayload);
 
         // Map numbers back onto the response for this specific user request
