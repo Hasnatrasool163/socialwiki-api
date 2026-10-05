@@ -159,7 +159,7 @@ const suggestRmAddress = async (req, res) => {
                 town: r.town || '',
                 postcode: isPc ? '' : (r.postcodes?.[0] || ''),
                 count: r.count || null,
-                more: r.type === 'street',
+                more: r.type === 'street' && (r.count || 0) > 1,
                 type: r.type
             };
         });
