@@ -117,29 +117,31 @@ const suggestRmAddress = async (req, res) => {
             postcodes: { $slice: 1 }
         }; 
 
+        const SUGGEST_LIMIT = 30;
+
         if (isPostcode(rest)) {
             const compactQuery = rest.replace(/\s+/g, '');
             results = await dictColl.find({
                 type: 'postcode',
                 compact: { $gte: compactQuery, $lt: nextPrefix(compactQuery) }
-            }).sort({ compact: 1 }).limit(10).project(projection).toArray();
+            }).sort({ compact: 1 }).limit(SUGGEST_LIMIT).project(projection).toArray();
         } else {
             results = await dictColl.find({
-                type: { $in: ['street', 'locality', 'building'] },
+                type: { $in: ['street', 'locality', 'building', 'premises'] },
                 key: { $gte: rest, $lt: nextPrefix(rest) }
-            }).sort({ key: 1 }).limit(10).maxTimeMS(300).project(projection).toArray();
+            }).sort({ key: 1, count: -1 }).limit(SUGGEST_LIMIT).maxTimeMS(300).project(projection).toArray();
 
-            if (results.length < 10) {
-                const words = rest.split(' ');
-                const last = words.pop();
-                if (last) {
-                    const tokenConditions = words.map(w => ({ tokens: w }));
-                    tokenConditions.push({ tokens: { $gte: last, $lt: nextPrefix(last) } });
+            if (results.length < SUGGEST_LIMIT) {
+                const words = rest.split(' ').filter(Boolean);
+                if (words.length > 0) {
+                    const tokenConditions = words.map(w => ({
+                        tokens: { $elemMatch: { $gte: w, $lt: nextPrefix(w) } }
+                    }));
 
                     const tokenResults = await dictColl.find({
-                        type: { $in: ['street', 'building'] },
+                        type: { $in: ['street', 'locality', 'building', 'premises'] },
                         $and: tokenConditions
-                    }).limit(10 - results.length).maxTimeMS(300).project(projection).toArray();
+                    }).sort({ count: -1, key: 1 }).limit(SUGGEST_LIMIT - results.length).maxTimeMS(300).project(projection).toArray();
 
                     const seen = new Set(results.map(r => String(r._id)));
                     tokenResults.forEach(r => {
@@ -196,7 +198,11 @@ const cascadeRmAddress = async (req, res) => {
         const proj = { projection: { postcode: 1, district: 1, address: 1 } };
         const base = [{ postcode: { $in: dictDoc.postcodes } }];
         if (dictDoc.street) {
-            base.push({ address: { $regex: `(^|[\\s,])${esc(dictDoc.street)}$`, $options: 'i' } });
+            const isStreet = dictDoc.type === 'street';
+            const pattern = isStreet
+                ? `(^|[\\s,])${esc(dictDoc.street)}$`
+                : `(^|[\\s,])${esc(dictDoc.street)}`;
+            base.push({ address: { $regex: pattern, $options: 'i' } });
         }
 
         const num = /^\d+[a-z]?$/i.test(requestedNumber || '') ? requestedNumber : null;
@@ -304,20 +310,21 @@ const searchRmAddress = async (req, res) => {
 
             // 2. Find the single best match in the Dictionary
             let dictDoc = await dictColl.findOne({
-                type: { $in: ['street', 'locality', 'building'] },
-                key: { $gte: rest,$lt: nextPrefix(rest) }
-            }, { sort: { key: 1 } });
+                type: { $in: ['street', 'locality', 'building', 'premises'] },
+                key: { $gte: rest, $lt: nextPrefix(rest) }
+            }, { sort: { count: -1, key: 1 } });
 
             // Token Fallback (if prefix fails)
             if (!dictDoc) {
-                const words = rest.split(' ');
-                const last = words.pop();
-                if (last) {
-                    const tokenConditions = words.map(w => ({ tokens: w }));
-                    tokenConditions.push({ tokens: { $gte: last,$lt: nextPrefix(last) } });
+                const words = rest.split(' ').filter(Boolean);
+                if (words.length > 0) {
+                    const tokenConditions = words.map(w => ({
+                        tokens: { $elemMatch: { $gte: w, $lt: nextPrefix(w) } }
+                    }));
                     dictDoc = await dictColl.findOne({
-                        type: { $in: ['street', 'building'] },$and: tokenConditions
-                    });
+                        type: { $in: ['street', 'locality', 'building', 'premises'] },
+                        $and: tokenConditions
+                    }, { sort: { count: -1, key: 1 } });
                 }
             }
 
@@ -333,7 +340,11 @@ const searchRmAddress = async (req, res) => {
             const proj = { projection: { postcode: 1, district: 1, address: 1 } };
             const base = [{ postcode: { $in: dictDoc.postcodes } }];
             if (dictDoc.street) {
-                base.push({ address: { $regex: `(^|[\\s,])${esc(dictDoc.street)}$`, $options: 'i' } });
+                const isStreet = dictDoc.type === 'street';
+                const pattern = isStreet
+                    ? `(^|[\\s,])${esc(dictDoc.street)}$`
+                    : `(^|[\\s,])${esc(dictDoc.street)}`;
+                base.push({ address: { $regex: pattern, $options: 'i' } });
             }
 
             const extras = [];
