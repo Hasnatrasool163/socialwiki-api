@@ -132,7 +132,8 @@ const suggestRmAddress = async (req, res) => {
             }).sort({ key: 1, count: -1 }).limit(SUGGEST_LIMIT).maxTimeMS(300).project(projection).toArray();
 
             if (results.length < SUGGEST_LIMIT) {
-                const words = rest.split(' ').filter(Boolean);
+                const cleanQuery = rest.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '');
+                const words = cleanQuery.split(/\s+/).filter(w => w.length > 0);
                 if (words.length > 0) {
                     const tokenConditions = words.map(w => ({
                         tokens: { $elemMatch: { $gte: w, $lt: nextPrefix(w) } }
@@ -141,7 +142,7 @@ const suggestRmAddress = async (req, res) => {
                     const tokenResults = await dictColl.find({
                         type: { $in: ['street', 'locality', 'building', 'premises'] },
                         $and: tokenConditions
-                    }).sort({ count: -1, key: 1 }).limit(SUGGEST_LIMIT - results.length).maxTimeMS(300).project(projection).toArray();
+                    }).sort({ count: -1, key: 1 }).limit(SUGGEST_LIMIT - results.length).maxTimeMS(1200).project(projection).toArray();
 
                     const seen = new Set(results.map(r => String(r._id)));
                     tokenResults.forEach(r => {
@@ -165,7 +166,10 @@ const suggestRmAddress = async (req, res) => {
                 type: r.type
             };
         });
-        searchCache.set(rest, safePayload);
+
+        if (safePayload.length > 0) {
+            searchCache.set(rest, safePayload);
+        }
 
         // Map numbers back onto the response for this specific user request
         res.json(safePayload.map(r => ({ ...r, requestedUnit: unit, requestedNumber: num })));
@@ -316,7 +320,8 @@ const searchRmAddress = async (req, res) => {
 
             // Token Fallback (if prefix fails)
             if (!dictDoc) {
-                const words = rest.split(' ').filter(Boolean);
+                const cleanQuery = rest.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '');
+                const words = cleanQuery.split(/\s+/).filter(w => w.length > 0);
                 if (words.length > 0) {
                     const tokenConditions = words.map(w => ({
                         tokens: { $elemMatch: { $gte: w, $lt: nextPrefix(w) } }
