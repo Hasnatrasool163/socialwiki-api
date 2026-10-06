@@ -117,7 +117,7 @@ const suggestRmAddress = async (req, res) => {
             postcodes: { $slice: 1 }
         }; 
 
-        const SUGGEST_LIMIT = 30;
+        const SUGGEST_LIMIT = 50;
 
         if (isPostcode(rest)) {
             const compactQuery = rest.replace(/\s+/g, '');
