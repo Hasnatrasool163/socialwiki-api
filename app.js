@@ -23,6 +23,17 @@ const searchRoutes = require('./routes/searchRoutes');
 
 const app = express();
 
+// Trust proxy (Cloudflare / Nginx reverse proxies)
+app.set('trust proxy', true);
+
+// Extract real visitor IP (Cloudflare CF-Connecting-IP -> X-Forwarded-For -> socket)
+app.use((req, res, next) => {
+    const cfIp = req.headers['cf-connecting-ip'];
+    const xff = req.headers['x-forwarded-for'];
+    req.realIp = cfIp || (xff ? xff.split(',')[0].trim() : req.socket.remoteAddress);
+    next();
+});
+
 // Body parser - Move this before security middleware
 app.use(express.json({ limit: '50mb' })); // Increased limit for large requests
 

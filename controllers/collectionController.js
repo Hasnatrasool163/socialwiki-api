@@ -22,6 +22,8 @@ const getCollectionStats = async (req, res) => {
             return true;
         });
 
+        const stats = [];
+
         // Get stats for each allowed collection
         for (const collection of filteredCollections) {
             const collectionName = collection.name;
