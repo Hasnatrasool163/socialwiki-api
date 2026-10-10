@@ -54,8 +54,8 @@ jobs:
           rm: false
           debug: true
 
-      # 4️⃣ Create production .env on server
-      - name: Create production .env on server
+      # 4️⃣ Ensure .env exists on server (do not overwrite existing server configuration)
+      - name: Verify .env exists on server
         uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -64,13 +64,10 @@ jobs:
           port: 22
           script: |
             cd /home/dev/api.socialwiki.co.uk/deploy
-            cat > .env <<EOF
-            NODE_ENV=production
-            PORT=${{ secrets.PORT }}
-            MONGODB_URI=${{ secrets.MONGODB_URI }}
-            JWT_SECRET=${{ secrets.JWT_SECRET }}
-            CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}
-            EOF
+            if [ ! -f .env ]; then
+              echo "WARNING: .env not found on server!"
+            fi
+
 
       # 5️⃣ Install dependencies on server
       - name: Install dependencies on server
