@@ -12,7 +12,8 @@ const { ObjectId } = require('mongoose').Types;
 
 const { verifyToken } = require('../middlewares/authmiddleware');
 const botProtect      = require('../middlewares/botProtect');
-const searchRateLimit = require('../middlewares/searchRateLimit');
+const searchSessionLimiter = require('../middlewares/searchSessionLimiter');
+const suggestLimiter  = require('../middlewares/suggestLimiter');
 const {
     searchRmAddress,
     suggestRmAddress,  
@@ -28,7 +29,7 @@ const {
 
 const router = express.Router();
 
-const guard = [verifyToken, botProtect, searchRateLimit];
+const guard = [verifyToken, botProtect, searchSessionLimiter];
 
 router.get('/rm-address',         ...guard, searchRmAddress);
 router.get('/prop-price',         ...guard, searchPropPrice);
@@ -41,7 +42,7 @@ router.get('/located-business',   ...guard, searchBusiness);
 router.get('/websites',           ...guard, searchWebsites);
 router.get('/website',            ...guard, searchWebsites);
 
-router.get('/rm-address/suggest', verifyToken, botProtect, suggestRmAddress);
+router.get('/rm-address/suggest', verifyToken, botProtect, suggestLimiter, suggestRmAddress);
 router.get('/rm-address/street',  ...guard, cascadeRmAddress);
 
 // Usage stats — no rate-limit hit, just needs auth

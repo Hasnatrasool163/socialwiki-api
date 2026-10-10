@@ -6,10 +6,13 @@ const userSchema = new mongoose.Schema({
     password: { type: String, required: true },
     role:     { type: String, enum: ['user', 'admin'], default: 'user' },
 
-    // --- search plan / rate-limit fields ---
-    plan:            { type: String, enum: ['pending', 'free', 'paid', 'admin'], default: 'pending' },
-    searchCount:     { type: Number, default: 0 },
-    searchResetDate: { type: Date,   default: () => new Date() },
+    // --- search plan / tier fields ---
+    plan:                { type: String, enum: ['pending', 'free', 'trial', 'level1', 'level2', 'level2_high', 'paid', 'admin'], default: 'pending' },
+    trialStartedAt:      { type: Date, default: () => new Date() },
+    trialReactivatedAt:  { type: Date },
+    reactivationCount:   { type: Number, default: 0 },
+    searchCount:         { type: Number, default: 0 },
+    searchResetDate:     { type: Date,   default: () => new Date() },
 }, {
     timestamps: true,
     collection: 'users',
