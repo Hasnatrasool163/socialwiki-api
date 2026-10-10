@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const authConnection = require('../config/authDb');
 
 const userSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true, trim: true },
@@ -11,7 +12,7 @@ const userSchema = new mongoose.Schema({
     searchResetDate: { type: Date,   default: () => new Date() },
 }, {
     timestamps: true,
-    collection: 'users',       // web_postalwiki.users
+    collection: 'users',
 });
 
-module.exports = mongoose.model('User', userSchema);
+module.exports = authConnection.model('User', userSchema);

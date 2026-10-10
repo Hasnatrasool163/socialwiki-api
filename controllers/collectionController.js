@@ -5,10 +5,25 @@ const getCollectionStats = async (req, res) => {
     try {
         // Get all collections from the database
         const collections = await mongoose.connection.db.listCollections().toArray();
-        const stats = [];
+        // Filter out sensitive collections (users, internal backups, dry-runs, and delete logs)
+        const EXCLUDED_COLLECTIONS = new Set([
+            'users',
+            'search_dictionary_dry_run',
+            'search_dictionary_dryrun',
+            'to_delete_postcodes',
+            'rm_address_deleted_backups',
+            'address_master_merged_parents_backup'
+        ]);
 
-        // Get stats for each collection
-        for (const collection of collections) {
+        const filteredCollections = collections.filter(c => {
+            const name = c.name;
+            if (name.startsWith('system.') || name.startsWith('tmp_')) return false;
+            if (EXCLUDED_COLLECTIONS.has(name)) return false;
+            return true;
+        });
+
+        // Get stats for each allowed collection
+        for (const collection of filteredCollections) {
             const collectionName = collection.name;
             const collectionStats = await mongoose.connection.db.command({ collStats: collectionName });
 

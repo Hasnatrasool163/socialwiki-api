@@ -5,7 +5,11 @@ const multer = require('multer');
 const { RMAddressController } = require('../controllers/RMAddress.controller');
 const { IMPORT_DIR } = require('../services/RMAddress.service');
 
+const { verifyToken } = require('../middlewares/authmiddleware');
+const { authorizeRoles } = require('../middlewares/rolemiddleware');
+
 const router = express.Router();
+router.use(verifyToken, authorizeRoles('admin'));
 
 const storage = multer.diskStorage({
 	destination: (req, file, cb) => {
