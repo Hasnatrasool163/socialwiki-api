@@ -23,6 +23,7 @@ const {
     isKillSwitchActive,
     logSearchAsync
 } = require('../services/limiter/rateLimiterService');
+const { getRealVisitorIp, evaluateSearchRisk } = require('../services/ip/ipRiskService');
 
 const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const EIGHT_WEEKS_MS = 8 * ONE_WEEK_MS;
@@ -100,7 +101,19 @@ const searchSessionLimiter = async (req, res, next) => {
             }
         }
 
-        // 5. Lookup session evaluation (sameSession prefix match within 30s)
+        // 5. IP Risk & Threat Intelligence check
+        const visitorIp = getRealVisitorIp(req);
+        const riskEval = await evaluateSearchRisk(user, visitorIp.ip);
+        if (!riskEval.allow) {
+            return res.status(403).json({
+                success: false,
+                vpnBlocked: true,
+                message: riskEval.reason
+            });
+        }
+        req.ipRisk = riskEval.verdict;
+
+        // 6. Lookup session evaluation (sameSession prefix match within 30s)
         const rawQuery = (req.query.q || req.query.term || req.query.postcode || req.query.query || '').trim();
         const { isNewSession, sessionId } = await evaluateSession(user._id.toString(), rawQuery);
 
@@ -200,7 +213,8 @@ const searchSessionLimiter = async (req, res, next) => {
                     totalResults: count,
                     found,
                     sessionId,
-                    ip: req.realIp || req.ip,
+                    ip: visitorIp.ip,
+                    ipRisk: req.ipRisk,
                     userAgent: req.headers['user-agent'],
                     plan,
                     postcodes

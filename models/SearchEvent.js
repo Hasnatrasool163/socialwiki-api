@@ -16,6 +16,14 @@ const searchEventSchema = new mongoose.Schema({
     found: { type: Boolean, default: false },
     searchSessionId: { type: String, index: true },
     ip: { type: String },
+    ipRisk: {
+        isVpn: Boolean,
+        isProxy: Boolean,
+        isTor: Boolean,
+        isAbuser: Boolean,
+        isDatacenter: Boolean,
+        reasons: [String]
+    },
     userAgent: { type: String },
 }, {
     timestamps: true,

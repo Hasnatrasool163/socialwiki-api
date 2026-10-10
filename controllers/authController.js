@@ -3,12 +3,23 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { registerSchema, loginSchema } = require('../validations/authValidation');
 const { ROLES } = require('../utils/constants');
-
-
+const { getRealVisitorIp, evaluateAuthRisk } = require('../services/ip/ipRiskService');
 
 exports.register = async (req, res) => {
     try {
         const validated = registerSchema.parse(req.body);
+
+        // Anti-bot & VPN threat gate for account creation
+        const clientIp = getRealVisitorIp(req);
+        const risk = await evaluateAuthRisk(clientIp.ip);
+        if (!risk.allow) {
+            return res.status(403).json({
+                success: false,
+                vpnBlocked: true,
+                message: risk.reason
+            });
+        }
+
         const existingUser = await User.findOne({ username: validated.username });
         if (existingUser) return res.status(400).json({ message: 'An account with this email already exists.' });
 
@@ -45,8 +56,18 @@ exports.login = async (req, res) => {
         if (!user) return res.status(400).json({ message: 'Invalid credentials' });
 
         const isMatch = await bcrypt.compare(validated.password, user.password);
-        
         if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+
+        // Non-admin accounts blocked if connecting from malicious/abuser/Tor networks
+        const clientIp = getRealVisitorIp(req);
+        const risk = await evaluateAuthRisk(clientIp.ip);
+        if (!risk.allow && user.role !== 'admin') {
+            return res.status(403).json({
+                success: false,
+                vpnBlocked: true,
+                message: risk.reason
+            });
+        }
 
         const FREE_DAILY_LIMIT = parseInt(process.env.FREE_DAILY_LIMIT || '50', 10);
         const midnight = new Date(); midnight.setUTCHours(24, 0, 0, 0);

@@ -182,6 +182,7 @@ function logSearchAsync(payload) {
                 found: !!found,
                 searchSessionId: sessionId,
                 ip,
+                ipRisk: payload.ipRisk,
                 userAgent
             }).catch(err => logger.error(`[SearchEvent] write failed: ${err.message}`));
 
