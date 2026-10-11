@@ -44,6 +44,9 @@ const logger = require('../config/logger');
  */
 exports.register = async (req, res) => {
     try {
+        if (!req.body.email && req.body.username) {
+            req.body.email = req.body.username;
+        }
         const validated = registerSchema.parse(req.body);
         const normalized = normalizeEmail(validated.email);
 
