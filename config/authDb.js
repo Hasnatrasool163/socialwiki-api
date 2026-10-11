@@ -3,24 +3,27 @@ const logger = require('./logger');
 
 // Dedicated connection for Authentication Database (web_postalwiki_auth)
 // Keeps user credentials and password hashes strictly isolated from search/data collections.
-const authUri = process.env.MONGODB_AUTH_URI || process.env.MONGODB_URI?.replace(/\/([^/?]+)(\?.*)?$/, '/web_postalwiki_auth$2') || 'mongodb://127.0.0.1:27017/web_postalwiki_auth';
+let authConnection;
 
-const authConnection = mongoose.createConnection(authUri, {
-    serverSelectionTimeoutMS: 10000,
-    socketTimeoutMS: 45000,
-    bufferCommands: false,
-    maxPoolSize: 10,
-    retryWrites: true,
-    w: 'majority',
-    autoIndex: false,
-});
+if (process.env.MONGODB_AUTH_URI) {
+    authConnection = mongoose.createConnection(process.env.MONGODB_AUTH_URI, {
+        serverSelectionTimeoutMS: 10000,
+        socketTimeoutMS: 45000,
+        maxPoolSize: 10,
+        retryWrites: true,
+        w: 'majority',
+    });
 
-authConnection.on('connected', () => {
-    logger.info(`Auth DB connected successfully to: ${authConnection.name || 'web_postalwiki_auth'}`);
-});
+    authConnection.on('connected', () => {
+        logger.info(`Auth DB connected successfully to: ${authConnection.name || 'web_postalwiki_auth'}`);
+    });
 
-authConnection.on('error', (err) => {
-    logger.error(`Auth DB connection error: ${err.message}`);
-});
+    authConnection.on('error', (err) => {
+        logger.error(`Auth DB connection error: ${err.message}`);
+    });
+} else {
+    logger.info('[authDb] MONGODB_AUTH_URI not provided; falling back to primary Mongoose connection.');
+    authConnection = mongoose;
+}
 
 module.exports = authConnection;

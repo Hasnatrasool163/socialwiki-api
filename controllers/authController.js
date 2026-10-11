@@ -215,8 +215,50 @@ exports.login = async (req, res) => {
         const clientIp = getRealVisitorIp(req);
         const risk = await evaluateAuthRisk(clientIp.ip);
 
-        // Find user by email or username
-        const user = await User.findOne({ $or: [{ email: normalized }, { username: normalized }] });
+        // Find user by email or username (case-insensitive)
+        const rawUsername = validated.username.trim();
+        let user = await User.findOne({
+            $or: [
+                { email: normalized },
+                { username: normalized },
+                { username: rawUsername },
+                { username: new RegExp(`^${rawUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+            ]
+        });
+
+        // Fallback: If not found in authConnection, check primary DB users collection for legacy admin accounts
+        if (!user) {
+            try {
+                const mongoose = require('mongoose');
+                const legacyDoc = await mongoose.connection.collection('users').findOne({
+                    $or: [
+                        { email: normalized },
+                        { username: normalized },
+                        { username: rawUsername }
+                    ]
+                });
+                if (legacyDoc) {
+                    user = new User({
+                        _id: legacyDoc._id,
+                        username: legacyDoc.username,
+                        email: legacyDoc.email || (legacyDoc.username.includes('@') ? legacyDoc.username : `${legacyDoc.username}@socialwiki.co.uk`),
+                        password: legacyDoc.password,
+                        role: legacyDoc.role || 'user',
+                        level: legacyDoc.level || (legacyDoc.role === 'admin' ? 'admin' : 'free'),
+                        plan: legacyDoc.plan || (legacyDoc.role === 'admin' ? 'admin' : 'free'),
+                        isVerified: true,
+                        isApproved: true,
+                        isBlocked: !!legacyDoc.isBlocked
+                    });
+                    await user.save().catch((saveErr) => {
+                        logger.warn(`[Login] Auto-migration save warning: ${saveErr.message}`);
+                    });
+                }
+            } catch (legacyErr) {
+                logger.warn(`[Login] Legacy user fallback check error: ${legacyErr.message}`);
+            }
+        }
+
         if (!user) return res.status(400).json({ success: false, message: 'Invalid email or password.' });
 
         // Non-admin accounts blocked if connecting from abusive / Tor networks
@@ -232,10 +274,17 @@ exports.login = async (req, res) => {
         const { isValid, needsRehash } = await verifyPassword(validated.password, user.password);
         if (!isValid) return res.status(400).json({ success: false, message: 'Invalid email or password.' });
 
-        // Automatic upgrade from legacy bcrypt to argon2id on successful login
+        // Automatic upgrade from legacy bcrypt to argon2id on successful login (non-fatal)
         if (needsRehash) {
-            user.password = await hashPassword(validated.password);
-            await user.save();
+            try {
+                user.password = await hashPassword(validated.password);
+                if (!user.email) {
+                    user.email = user.username.includes('@') ? user.username : `${user.username}@socialwiki.co.uk`;
+                }
+                await user.save();
+            } catch (rehashErr) {
+                logger.warn(`[Login] Password rehash save error: ${rehashErr.message}`);
+            }
         }
 
         // Account status checks
@@ -268,17 +317,19 @@ exports.login = async (req, res) => {
         // Set httpOnly secure cookie
         res.cookie('refreshToken', refreshToken, REFRESH_COOKIE_OPTIONS);
 
+        // Return both 'token' (for legacy Admin portal and play.ts) and 'accessToken'
         res.json({
             success: true,
+            token: accessToken,
             accessToken,
             user: {
                 id: user._id,
-                email: user.email,
+                email: user.email || user.username,
                 username: user.username,
                 role: user.role,
-                level: user.level || 'free',
-                plan: user.plan || 'free',
-                isVerified: user.isVerified,
+                level: user.level || (user.role === 'admin' ? 'admin' : 'free'),
+                plan: user.plan || (user.role === 'admin' ? 'admin' : 'free'),
+                isVerified: user.role === 'admin' ? true : user.isVerified,
                 savedDatabases: user.savedDatabases || ['rm'],
                 historyMode: user.historyMode || 'latest'
             }
@@ -287,8 +338,12 @@ exports.login = async (req, res) => {
         if (err.name === 'ZodError') {
             return res.status(400).json({ success: false, errors: err.errors });
         }
-        logger.error(`[Login error] ${err.message}`);
-        res.status(500).json({ success: false, message: 'Login failed. Please try again later.' });
+        logger.error(`[Login error] ${err.message} - ${err.stack}`);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Login failed. Please try again later.',
+            details: err.message
+        });
     }
 };
 

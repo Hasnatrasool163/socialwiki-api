@@ -43,7 +43,7 @@ function createAccessToken(user) {
  * Creates a new refresh token family for a login session
  */
 async function createRefreshTokenSession(user) {
-    const familyId = crypto.randomUUID();
+    const familyId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
     const version = 1;
     const redis = getRedisClient();
 
@@ -53,10 +53,15 @@ async function createRefreshTokenSession(user) {
         createdAt: Date.now()
     };
 
-    if (isRedisReady() && redis) {
-        // Store session family in Redis with 7-day TTL
-        await redis.set(`session:family:${familyId}`, JSON.stringify(sessionData), 'EX', 7 * 86400);
-    } else {
+    try {
+        if (isRedisReady() && redis) {
+            // Store session family in Redis with 7-day TTL
+            await redis.set(`session:family:${familyId}`, JSON.stringify(sessionData), 'EX', 7 * 86400);
+        } else {
+            memorySessionFamilies.set(familyId, sessionData);
+        }
+    } catch (redisErr) {
+        logger.warn(`[tokenService] Redis save failed: ${redisErr.message}, falling back to memory store`);
         memorySessionFamilies.set(familyId, sessionData);
     }
 
