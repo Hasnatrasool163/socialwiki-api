@@ -14,14 +14,44 @@ const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY || '';
 const verifyTurnstile = async (req, res, next) => {
     // 1. Graceful bypass if neither Turnstile nor reCAPTCHA key is configured in .env
     if (!TURNSTILE_SECRET_KEY && !RECAPTCHA_SECRET_KEY) {
-        logger.warn('[Bot Verification] Neither TURNSTILE_SECRET_KEY nor RECAPTCHA_SECRET_KEY is configured. Bypassing bot check for testing.');
         return next();
+    }
+
+    // 2. Admin Portal Exemption (Never block admin portal logins/actions)
+    const origin = (req.headers.origin || req.headers.referer || '').toLowerCase();
+    if (origin.includes('admin.socialwiki') || origin.includes('admin.postalwiki')) {
+        return next();
+    }
+
+    // 3. Admin User Exemption (Admins are authenticated via strong password, never locked out by bot challenge)
+    if (req.body?.username) {
+        try {
+            const User = require('../models/User');
+            const identifier = req.body.username.toString().trim().toLowerCase();
+            const targetUser = await User.findOne({ $or: [{ email: identifier }, { username: identifier }] }).select('role');
+            if (targetUser && targetUser.role === 'admin') {
+                return next();
+            }
+        } catch (_) {}
     }
 
     const token = req.body?.turnstileToken || req.body?.recaptchaToken || req.body?.token || req.headers['cf-turnstile-response'];
     const ip = req.realIp || req.ip;
 
+    // 4. Missing token handling
     if (!token) {
+        // If it's a login request and no token was provided, allow it through
+        // (Ensures logins are not blocked before the frontend widget is deployed)
+        if (req.path === '/login' || req.originalUrl?.includes('/login')) {
+            return next();
+        }
+
+        // On signup/reset, if ENFORCE_BOT_CHALLENGE is not 'true', allow for direct/API testing
+        if (process.env.ENFORCE_BOT_CHALLENGE !== 'true') {
+            logger.warn(`[Bot Verification] No bot token provided on ${req.originalUrl}; bypassing (ENFORCE_BOT_CHALLENGE is not set to true).`);
+            return next();
+        }
+
         return res.status(400).json({
             success: false,
             message: 'Bot verification token is required. Please complete the security check.'
