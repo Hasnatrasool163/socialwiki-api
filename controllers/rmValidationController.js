@@ -219,8 +219,11 @@ const getPostcodes = async (req, res) => {
         const coll = db.collection('postcode_district');
 
         if (isFull) {
-            // Exact full postcode query
-            const exactDoc = await coll.findOne({ postcode: queryPostcode });
+            // Exact full postcode query (must be an active postcode)
+            const exactDoc = await coll.findOne({
+                postcode: queryPostcode,
+                district: { $ne: 'NOT ACTIVE' }
+            });
             if (!exactDoc) {
                 // Record unrecognised valid postcode in Not Found Queue
                 try {
@@ -234,8 +237,8 @@ const getPostcodes = async (req, res) => {
 
                 return res.status(404).json({
                     postcodes: [],
-                    error: 'Postcode not recognised',
-                    message: 'Postcode not recognised'
+                    error: 'Postcode not recognised or no longer active',
+                    message: 'Postcode not recognised or no longer active'
                 });
             }
 
@@ -258,12 +261,14 @@ const getPostcodes = async (req, res) => {
 
         const limit = 120;
         const cursor = coll.find({
-            postcode: { $gte: queryPostcode, $lt: upperBound }
+            postcode: { $gte: queryPostcode, $lt: upperBound },
+            district: { $ne: 'NOT ACTIVE' }
         }).project({ postcode: 1, district: 1, _id: 0 }).sort({ postcode: 1 }).limit(limit + 1);
 
         const rows = await cursor.toArray();
-        const truncated = rows.length > limit;
-        const results = (truncated ? rows.slice(0, limit) : rows).map(r => ({
+        const activeRows = rows.filter(r => r.district && r.district.trim().toUpperCase() !== 'NOT ACTIVE');
+        const truncated = activeRows.length > limit;
+        const results = (truncated ? activeRows.slice(0, limit) : activeRows).map(r => ({
             postcode: r.postcode,
             town: r.district || ''
         }));
