@@ -21,6 +21,7 @@ const rmAddressAiRoutes = require('./routes/rmAddressAiRoutes');
 const rmAddressPrecheckRoutes = require('./routes/rmAddressPrecheckRoutes');
 const rmAddressCheckedRoutes = require('./routes/rmAddressCheckedRoutes');
 const searchRoutes = require('./routes/searchRoutes');
+const rmValidationRoutes = require('./routes/rmValidationRoutes');
 
 const app = express();
 
@@ -123,6 +124,9 @@ app.use('/api/rm-address/ai', rmAddressAiRoutes);
 app.use('/api/rm-address/precheck', rmAddressPrecheckRoutes);
 app.use('/api/rm-address/checked', rmAddressCheckedRoutes);
 app.use('/api/rm-address', rmAddressRoutes);
+
+// Phase 3: RM Validation & Business Find
+app.use('/api/rm', rmValidationRoutes);
 
 // Public search routes (JWT-authenticated, rate-limited — guards inside searchRoutes)
 app.use('/api/search', searchRoutes);
