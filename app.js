@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
 
 const authRoutes = require('./routes/authRoutes');
 const ssUrlRoutes = require('./routes/ssUrlRoutes');
@@ -34,8 +35,9 @@ app.use((req, res, next) => {
     next();
 });
 
-// Body parser - Move this before security middleware
-app.use(express.json({ limit: '50mb' })); // Increased limit for large requests
+// Body parser & Cookies
+app.use(express.json({ limit: '50mb' }));
+app.use(cookieParser());
 
 // CORS configuration - Move this before other middleware
 const corsOptions = {

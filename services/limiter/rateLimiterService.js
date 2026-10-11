@@ -74,6 +74,12 @@ const level2HighMonthlyLimiter = createLimiterPair('rl_l2h_month', 3000, 30 * 86
 const paidDailyLimiter = createLimiterPair('rl_paid_day', parseInt(process.env.PAID_DAILY_LIMIT || '500', 10), 86400);
 
 // ---------------------------------------------------------------------------
+// 3. Signup & Auth Abuse Limiters (Max 5/day per IP, 15/day per /24 subnet)
+// ---------------------------------------------------------------------------
+const signupIpLimiter = createLimiterPair('rl_sign_ip', 5, 86400);
+const signupSubnetLimiter = createLimiterPair('rl_sign_sub', 15, 86400);
+
+// ---------------------------------------------------------------------------
 // 3. Lookup Session Matcher
 // ---------------------------------------------------------------------------
 const sameSession = (prev, q, now) => {
@@ -232,6 +238,8 @@ module.exports = {
     level2HighDailyLimiter,
     level2HighMonthlyLimiter,
     paidDailyLimiter,
+    signupIpLimiter,
+    signupSubnetLimiter,
     evaluateSession,
     isKillSwitchActive,
     logSearchAsync
