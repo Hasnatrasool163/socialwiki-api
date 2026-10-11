@@ -48,6 +48,10 @@ async function sendEmailDirect({ to, subject, html, text }) {
             html,
             text
         });
+        if (result.error) {
+            logger.error(`[Email] Resend API error sending to ${to}: [${result.error.name}] ${result.error.message}`);
+            throw new Error(result.error.message);
+        }
         logger.info(`[Email] Successfully sent email to ${to} (id: ${result.data?.id})`);
         return { success: true, id: result.data?.id };
     } catch (err) {
