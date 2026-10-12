@@ -16,8 +16,8 @@ const TIER_CONSTANTS = {
         monthlySearchLimit: 150,
         rmTrialWeeks: 8,
         advTrialWeeks: 1,
-        description: '5 searches/day (Royal Mail: 8 weeks; Multi-DB: 1 week preview)',
-        datasets: ['Royal Mail (preview)', 'Limited Multi-DB (1 week preview)'],
+        description: '5 searches/day (RM: 8 weeks; Multi-DB: 1 week preview)',
+        datasets: ['RM (preview)', 'Limited Multi-DB (1 week preview)'],
         badgeVariant: 'secondary'
     },
     trial: {
@@ -30,7 +30,7 @@ const TIER_CONSTANTS = {
         rmTrialWeeks: 8,
         advTrialWeeks: 1,
         description: '5 searches/day (Initial 8-week trial)',
-        datasets: ['Royal Mail (preview)', 'Limited Multi-DB (1 week preview)'],
+        datasets: ['RM (preview)', 'Limited Multi-DB (1 week preview)'],
         badgeVariant: 'secondary'
     },
     level1: {
@@ -41,7 +41,7 @@ const TIER_CONSTANTS = {
         weeklySearchLimit: 60,
         monthlySearchLimit: 260,
         description: '20 searches/day, 60 searches/week',
-        datasets: ['Royal Mail address lookup only'],
+        datasets: ['RM address lookup only'],
         badgeVariant: 'emerald'
     },
     level2: {
@@ -52,7 +52,7 @@ const TIER_CONSTANTS = {
         weeklySearchLimit: 700,
         monthlySearchLimit: 1000,
         description: '100 searches/day fair-use, 1,000 searches/month',
-        datasets: ['Royal Mail', 'Property Prices', 'Company House', 'Social Footprints', 'Businesses'],
+        datasets: ['RM', 'Property Prices', 'Company House', 'Social Footprints', 'Businesses'],
         badgeVariant: 'blue'
     },
     level2_high: {
@@ -63,7 +63,7 @@ const TIER_CONSTANTS = {
         weeklySearchLimit: 2100,
         monthlySearchLimit: 3000,
         description: '300 searches/day fair-use, 3,000 searches/month',
-        datasets: ['Royal Mail', 'Property Prices', 'Company House', 'Social Footprints', 'Businesses'],
+        datasets: ['RM', 'Property Prices', 'Company House', 'Social Footprints', 'Businesses'],
         badgeVariant: 'indigo'
     },
     business: {
