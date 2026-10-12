@@ -22,6 +22,7 @@ const rmAddressPrecheckRoutes = require('./routes/rmAddressPrecheckRoutes');
 const rmAddressCheckedRoutes = require('./routes/rmAddressCheckedRoutes');
 const searchRoutes = require('./routes/searchRoutes');
 const rmValidationRoutes = require('./routes/rmValidationRoutes');
+const adminUsersRoutes = require('./routes/adminUsersRoutes');
 
 const app = express();
 
@@ -131,6 +132,9 @@ app.use('/api/rm', rmValidationRoutes);
 // Public search routes (JWT-authenticated, rate-limited — guards inside searchRoutes)
 app.use('/api/search', searchRoutes);
 
+
+// Admin Users management routes
+app.use('/api/admin/users', adminUsersRoutes);
 
 app.get('/admin', verifyToken, authorizeRoles('admin'), (req, res) => {
     res.json({ message: 'Welcome admin!' });

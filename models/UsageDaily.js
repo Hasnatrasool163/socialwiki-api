@@ -8,6 +8,7 @@ const usageDailySchema = new mongoose.Schema({
     searchCount: { type: Number, default: 0 },
     sessionCount: { type: Number, default: 0 },
     rowCount: { type: Number, default: 0 },
+    distinctPostcodeCount: { type: Number, default: 0 },
     distinctPostcodes: [{ type: String }],
     distinctRecords: [{ type: String }],
 }, {

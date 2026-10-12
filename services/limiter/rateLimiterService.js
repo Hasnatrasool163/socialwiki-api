@@ -210,15 +210,22 @@ function logSearchAsync(payload) {
             // 3. Roll up into UsageDaily in auth DB
             if (userId) {
                 const dateKey = new Date().toISOString().slice(0, 10);
+                const safePostcodes = (postcodes || []).slice(0, 50);
                 await UsageDaily.findOneAndUpdate(
                     { userId, date: dateKey },
                     {
-                        $inc: { searchCount: 1, rowCount: totalResults || 0 },
+                        $inc: { searchCount: 1, rowCount: totalResults || 0, distinctPostcodeCount: safePostcodes.length },
                         $setOnInsert: { plan: plan || 'free' },
-                        $addToSet: { distinctPostcodes: { $each: postcodes.slice(0, 50) } }
+                        $addToSet: { distinctPostcodes: { $each: safePostcodes } }
                     },
                     { upsert: true }
                 ).catch(err => logger.error(`[UsageDaily] rollup failed: ${err.message}`));
+
+                // Enforce 500-entry max cap on distinctPostcodes
+                await UsageDaily.updateOne(
+                    { userId, date: dateKey, 'distinctPostcodes.500': { $exists: true } },
+                    { $push: { distinctPostcodes: { $each: [], $slice: 500 } } }
+                ).catch(() => {});
             }
         } catch (err) {
             logger.error(`[RateLimiterService] logSearchAsync error: ${err.message}`);

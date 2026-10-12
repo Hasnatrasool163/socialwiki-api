@@ -13,8 +13,15 @@ const userSchema = new mongoose.Schema({
 
     // --- Verification & Security Flags ---
     isVerified: { type: Boolean, default: false },
+    emailVerifiedAt: { type: Date },
     isApproved: { type: Boolean, default: false }, // Admin approval for free accounts ('Request Access')
+    approvedAt: { type: Date },
+    approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     isBlocked:  { type: Boolean, default: false },
+    blockedAt:  { type: Date },
+    blockedBy:  { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    blockReason: { type: String, trim: true },
+    tokenRevokedBefore: { type: Date },
 
     // --- Single-Use Hashed Tokens ---
     verificationTokenHash:    { type: String, index: true },
