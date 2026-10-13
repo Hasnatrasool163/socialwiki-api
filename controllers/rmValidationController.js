@@ -18,6 +18,62 @@ const NotFoundQueue = require('../models/NotFoundQueue');
 const SearchEvent = require('../models/SearchEvent');
 const UsageDaily = require('../models/UsageDaily');
 const logger = require('../config/logger');
+const { getPostcodeCentroid } = require('../services/centroidService');
+const { locateAddress } = require('../services/geocoderService');
+
+// Fixed unit hint labels in priority order (Phase 3 addendum)
+const STRUCTURAL_HINT_DEFINITIONS = [
+    { label: 'Floor/Level', regex: /\b(?:floor|level|ground\s*floor|[0-9]+(?:st|nd|rd|th)\s*floor|basement)\b/i },
+    { label: 'Block',       regex: /\bblock\b/i },
+    { label: 'Flat',        regex: /\bflat\b/i },
+    { label: 'Apartment',   regex: /\b(?:apartment|apt)\b/i },
+    { label: 'Suite',       regex: /\bsuite\b/i },
+    { label: 'Unit',        regex: /\bunit\b/i },
+    { label: 'Room',        regex: /\broom\b/i },
+    { label: 'Studio',      regex: /\bstudio\b/i }
+];
+
+function sanitizeInput(str, maxLen = 30) {
+    if (!str || typeof str !== 'string') return '';
+    return str.replace(/<[^>]*>/g, '').replace(/[\x00-\x1F\x7F]/g, '').trim().slice(0, maxLen);
+}
+
+function detectUnitHints(rows, streetLower, typedNumber, typedName) {
+    const matchedRows = [];
+    for (const r of rows) {
+        if (!r.address) continue;
+        const parsed = parseAddressRow(r.address);
+        if (!parsed || !parsed.street || parsed.street.toLowerCase() !== streetLower) continue;
+
+        if (typedNumber) {
+            const pNum = (parsed.numberPart || '').toLowerCase();
+            const tNum = typedNumber.toLowerCase();
+            if (pNum === tNum || pNum.startsWith(tNum)) {
+                matchedRows.push(r.address);
+                continue;
+            }
+        }
+        if (typedName && parsed.premises && parsed.premises.length > 0) {
+            const pStr = parsed.premises.join(' ').toLowerCase();
+            if (pStr.includes(typedName.toLowerCase())) {
+                matchedRows.push(r.address);
+                continue;
+            }
+        }
+    }
+
+    const candidateTexts = matchedRows.length > 0 ? matchedRows : rows.map(r => r.address);
+    const joinedText = candidateTexts.join('\n');
+
+    const hints = [];
+    for (const item of STRUCTURAL_HINT_DEFINITIONS) {
+        if (item.regex.test(joinedText)) {
+            hints.push(item.label);
+            if (hints.length === 3) break;
+        }
+    }
+    return hints;
+}
 
 // LRU Caches for sub-10ms performance
 const streetCache = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 * 24 }); // 24h
@@ -322,12 +378,14 @@ const getStreets = async (req, res) => {
         }
 
         const uniqueStreets = Array.from(streetSet).sort((a, b) => a.localeCompare(b));
+        const centroid = await getPostcodeCentroid(pc);
         const payload = {
             postcode: pc,
             town,
             streets: uniqueStreets,
             preselect: uniqueStreets.length === 1,
-            manualEntry: uniqueStreets.length === 0
+            manualEntry: uniqueStreets.length === 0,
+            centroid: centroid ? { lat: centroid.lat, lon: centroid.lon } : null
         };
 
         streetCache.set(pc, payload);
@@ -346,9 +404,9 @@ const validateAddress = async (req, res) => {
         const { postcode: rawPc, street: rawStreet, number: rawNumber, name: rawName, unit: rawUnit } = req.body || {};
         const pc = normalizePostcode(rawPc);
         const street = cleanStreetName(rawStreet);
-        const typedNumber = (rawNumber || '').trim();
-        const typedName = (rawName || '').trim().toLowerCase();
-        const typedUnit = (rawUnit || '').trim();
+        const typedNumber = sanitizeInput(rawNumber);
+        const typedName = sanitizeInput(rawName);
+        const typedUnit = sanitizeInput(rawUnit);
 
         if (!pc || !street) {
             return res.status(400).json({ error: 'Postcode and street are required for validation' });
@@ -378,7 +436,6 @@ const validateAddress = async (req, res) => {
         // Match in-memory
         let matchedBuilding = null;
         let matchedRangeLabel = null;
-        let unitPrompt = null;
         let isMatched = false;
 
         const streetLower = street.toLowerCase();
@@ -389,16 +446,10 @@ const validateAddress = async (req, res) => {
 
             if (parsed.street.toLowerCase() !== streetLower) continue;
 
-            if (parsed.unitPrompt && !unitPrompt) {
-                unitPrompt = parsed.unitPrompt;
-            }
-
             // Check house number match
             if (typedNumber) {
                 const parsedNum = parsed.numberPart || '';
                 if (parsedNum) {
-                    // Match single number or range
-                    // e.g. typedNumber "101" vs range "101-103"
                     const rangeMatch = parsedNum.match(/^(\d+)-(\d+)$/);
                     if (rangeMatch) {
                         const low = parseInt(rangeMatch[1], 10);
@@ -420,7 +471,6 @@ const validateAddress = async (req, res) => {
                         }
                         break;
                     } else if (/^\d+$/.test(typedNumber) && parsedNum.toLowerCase().startsWith(typedNumber.toLowerCase())) {
-                        // "57" matches "57A"
                         isMatched = true;
                         matchedRangeLabel = parsedNum;
                         if (parsed.premises && parsed.premises.length > 0) {
@@ -434,7 +484,7 @@ const validateAddress = async (req, res) => {
             // Check house/building name match
             if (typedName && parsed.premises && parsed.premises.length > 0) {
                 const rowPremises = parsed.premises.join(' ').toLowerCase();
-                if (rowPremises === typedName || rowPremises.includes(typedName)) {
+                if (rowPremises === typedName.toLowerCase() || rowPremises.includes(typedName.toLowerCase())) {
                     isMatched = true;
                     matchedBuilding = parsed.premises.join(', ');
                     if (parsed.numberPart) matchedRangeLabel = parsed.numberPart;
@@ -443,8 +493,10 @@ const validateAddress = async (req, res) => {
             }
         }
 
-        // Final address assembly (Section 6.5, Step 6)
-        // unit, building/house name, number and street, locality, town, postcode
+        // Detect structural unit hints (up to 3 labels in fixed order: Floor/Level, Block, Flat, Apartment, Suite, Unit, Room, Studio)
+        const unitHints = detectUnitHints(rows, streetLower, typedNumber, typedName);
+
+        // Final address assembly (fixed order: unit, building name, number and street, town, postcode)
         const line1Parts = [];
         if (typedUnit) line1Parts.push(typedUnit);
         if (matchedBuilding) {
@@ -462,34 +514,62 @@ const validateAddress = async (req, res) => {
             locality: '',
             town,
             postcode: pc,
-            formatted: [line1Parts.join(', '), town, pc].filter(Boolean).join(', '),
-            validated: isMatched ? 'street' : 'street_confirmed'
+            formatted: [line1Parts.join(', '), town, pc].filter(Boolean).join(', ')
+        };
+
+        // Track userEntered fields
+        const userEntered = [];
+        if (typedNumber) userEntered.push('number');
+        if (typedName) userEntered.push('name');
+        if (typedUnit) userEntered.push('unit');
+
+        // Validated booleans per specification (number and unit are unverified/false)
+        const validated = {
+            postcode: true,
+            street: true,
+            number: false,
+            unit: false
         };
 
         // Record search session in usage
         await recordUsage(req.user, 'rm_validate', `${pc} ${street}`);
 
-        if (isMatched) {
-            return res.json({
-                status: 'matched',
-                buildingName: matchedBuilding || null,
-                rangeLabel: matchedRangeLabel || null,
-                unitPrompt: unitPrompt ? `Enter ${unitPrompt}` : null,
-                address: formattedAddress
-            });
-        }
-
-        // Never tell the user that a number or name is wrong or does not exist.
-        // Return 'street_confirmed' and let them continue.
         return res.json({
-            status: 'street_confirmed',
+            status: isMatched ? 'matched' : 'street_confirmed',
             message: 'Postcode and street confirmed',
-            unitPrompt: unitPrompt ? `Enter ${unitPrompt}` : null,
-            address: formattedAddress
+            validated,
+            address: formattedAddress,
+            userEntered,
+            unitHints,
+            buildingName: matchedBuilding || null,
+            rangeLabel: matchedRangeLabel || null
         });
     } catch (err) {
         logger.error(`validateAddress error: ${err.message}`);
         return res.status(500).json({ error: 'Address validation failed' });
+    }
+};
+
+// ============================================================================
+// 3b. POST /api/rm/locate (Server-side geocoding)
+// ============================================================================
+const locateAddressHandler = async (req, res) => {
+    try {
+        const { postcode: rawPc, street: rawStreet, number: rawNumber, unit: rawUnit } = req.body || {};
+        const pc = normalizePostcode(rawPc);
+        if (!pc) {
+            return res.status(400).json({ error: 'Valid postcode is required for geocoding' });
+        }
+
+        const street = sanitizeInput(rawStreet);
+        const number = sanitizeInput(rawNumber);
+        const unit = sanitizeInput(rawUnit);
+
+        const result = await locateAddress({ postcode: pc, street, number, unit });
+        return res.json(result);
+    } catch (err) {
+        logger.error(`locateAddressHandler error: ${err.message}`);
+        return res.status(500).json({ error: 'Address location failed' });
     }
 };
 
@@ -675,6 +755,7 @@ module.exports = {
     getPostcodes,
     getStreets,
     validateAddress,
+    locateAddress: locateAddressHandler,
     findBusiness,
     getAreas,
     parseAddressRow,

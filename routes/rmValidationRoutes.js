@@ -14,6 +14,7 @@ const {
     getPostcodes,
     getStreets,
     validateAddress,
+    locateAddress,
     findBusiness,
     getAreas
 } = require('../controllers/rmValidationController');
@@ -26,6 +27,7 @@ const guard = [verifyToken, botProtect];
 router.get('/postcodes', ...guard, suggestLimiter, getPostcodes);
 router.get('/streets',   ...guard, getStreets);
 router.post('/validate', ...guard, validateAddress);
+router.post('/locate',   ...guard, locateAddress);
 
 // Business find flow: Find a business address
 router.get('/business',  ...guard, findBusiness);
