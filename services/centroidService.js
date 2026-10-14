@@ -23,7 +23,27 @@ const centroidCache = new LRUCache({
  */
 function normalizePostcode(raw) {
     if (!raw) return '';
-    const clean = raw.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const s = String(raw).trim().toUpperCase();
+
+    // 1. Full postcode: "DN41 7RU" or "DN417RU"
+    const fullMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s*([0-9][A-Z]{2})$/i);
+    if (fullMatch) {
+        return `${fullMatch[1]} ${fullMatch[2]}`;
+    }
+
+    // 2. Sector: "DN41 7" or "DN417"
+    const sectorMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s*([0-9])$/i);
+    if (sectorMatch) {
+        return `${sectorMatch[1]} ${sectorMatch[2]}`;
+    }
+
+    // 3. Outcode only: "DN41"
+    const outcodeMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)$/i);
+    if (outcodeMatch) {
+        return outcodeMatch[1];
+    }
+
+    const clean = s.replace(/[^A-Z0-9]/g, '');
     if (clean.length > 3) {
         return `${clean.slice(0, -3)} ${clean.slice(-3)}`;
     }
@@ -31,11 +51,11 @@ function normalizePostcode(raw) {
 }
 
 /**
- * Retrieve centroid { lat, lon } for a given UK postcode
+ * Retrieve centroid { lat, lon } for a given UK postcode or sector
  */
 async function getPostcodeCentroid(rawPostcode) {
     const pc = normalizePostcode(rawPostcode);
-    if (!pc || !pc.includes(' ')) return null;
+    if (!pc) return null;
 
     // 1. LRU Cache check
     if (centroidCache.has(pc)) {
@@ -43,19 +63,27 @@ async function getPostcodeCentroid(rawPostcode) {
     }
 
     try {
-        // 2. MongoDB check
-        const doc = await PostcodeCentroid.findOne({ postcode: pc }).lean();
+        // 2. MongoDB check (exact match or sector prefix)
+        let doc = await PostcodeCentroid.findOne({ postcode: pc }).lean();
+        if (!doc) {
+            const escaped = pc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            doc = await PostcodeCentroid.findOne({ postcode: { $regex: `^${escaped}` } }).lean();
+        }
+
         if (doc && typeof doc.lat === 'number' && typeof doc.lon === 'number') {
             const centroid = { lat: doc.lat, lon: doc.lon, source: doc.source || 'os_codepoint_open' };
             centroidCache.set(pc, centroid);
             return centroid;
         }
 
-        // 3. Fallback to api.postcodes.io (OGL license, supports full UK including BT postcodes)
-        const encoded = encodeURIComponent(pc);
-        const resp = await axios.get(`https://api.postcodes.io/postcodes/${encoded}`, {
-            timeout: 2000
-        });
+        // 3. Fallback to api.postcodes.io
+        const isFull = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s+[0-9][A-Z]{2}$/i.test(pc);
+        const outcode = pc.split(' ')[0];
+        const url = isFull
+            ? `https://api.postcodes.io/postcodes/${encodeURIComponent(pc)}`
+            : `https://api.postcodes.io/outcodes/${encodeURIComponent(outcode)}`;
+
+        const resp = await axios.get(url, { timeout: 2000 });
 
         if (resp.data && resp.data.result && typeof resp.data.result.latitude === 'number') {
             const lat = resp.data.result.latitude;
@@ -63,7 +91,7 @@ async function getPostcodeCentroid(rawPostcode) {
             const eastings = resp.data.result.eastings || null;
             const northings = resp.data.result.northings || null;
             const isBT = pc.startsWith('BT');
-            const source = isBT ? 'osni_postcodes_io' : 'postcodes_io_ogl';
+            const source = isBT ? 'osni_postcodes_io' : (isFull ? 'postcodes_io_ogl' : 'postcodes_io_outcode');
 
             const centroid = { lat, lon, source };
             centroidCache.set(pc, centroid);

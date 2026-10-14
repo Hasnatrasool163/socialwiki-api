@@ -200,11 +200,32 @@ function cleanStreetName(s) {
 }
 
 /**
- * Normalise postcode string
+ * Normalise postcode string (handles full postcodes, sectors e.g. DN41 7, and outcodes)
  */
 function normalizePostcode(raw) {
     if (!raw) return '';
-    const clean = raw.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const s = String(raw).trim().toUpperCase();
+
+    // 1. Full postcode: "DN41 7RU" or "DN417RU"
+    const fullMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s*([0-9][A-Z]{2})$/i);
+    if (fullMatch) {
+        return `${fullMatch[1]} ${fullMatch[2]}`;
+    }
+
+    // 2. Sector: "DN41 7" or "DN417"
+    const sectorMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s*([0-9])$/i);
+    if (sectorMatch) {
+        return `${sectorMatch[1]} ${sectorMatch[2]}`;
+    }
+
+    // 3. Outcode only: "DN41"
+    const outcodeMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)$/i);
+    if (outcodeMatch) {
+        return outcodeMatch[1];
+    }
+
+    // Fallback: clean alphanumeric
+    const clean = s.replace(/[^A-Z0-9]/g, '');
     if (clean.length > 3) {
         return `${clean.slice(0, -3)} ${clean.slice(-3)}`;
     }
@@ -359,21 +380,38 @@ const getStreets = async (req, res) => {
         const db = req.app.locals.db || mongoose.connection.db;
         const coll = db.collection('address_master_merged');
 
-        const rows = await coll.find({ postcode: pc })
-            .project({ address: 1, district: 1 })
-            .toArray();
+        const isFull = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s+[0-9][A-Z]{2}$/i.test(pc);
+        let rows = [];
 
-        if (!rows.length) {
-            return res.json({ streets: [], town: '', preselect: false, manualEntry: true });
+        if (isFull) {
+            rows = await coll.find({ postcode: pc })
+                .project({ address: 1, district: 1, street: 1 })
+                .toArray();
+        } else {
+            // Sector or prefix query e.g. "DN41 7"
+            const escaped = pc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            rows = await coll.find({ postcode: { $regex: `^${escaped}` } })
+                .project({ address: 1, district: 1, street: 1 })
+                .limit(3000)
+                .toArray();
         }
 
-        const town = rows[0].district || '';
+        if (!rows.length) {
+            return res.json({ postcode: pc, streets: [], town: '', preselect: false, manualEntry: true });
+        }
+
+        let town = '';
         const streetSet = new Set();
 
         for (const row of rows) {
-            const parsed = parseAddressRow(row.address);
-            if (parsed && parsed.street) {
-                streetSet.add(parsed.street);
+            if (!town && row.district) town = row.district;
+            if (row.street) {
+                streetSet.add(cleanStreetName(row.street));
+            } else if (row.address) {
+                const parsed = parseAddressRow(row.address);
+                if (parsed && parsed.street) {
+                    streetSet.add(parsed.street);
+                }
             }
         }
 
@@ -427,9 +465,20 @@ const validateAddress = async (req, res) => {
         const db = req.app.locals.db || mongoose.connection.db;
         const coll = db.collection('address_master_merged');
 
-        const rows = await coll.find({ postcode: pc })
-            .project({ address: 1, district: 1 })
-            .toArray();
+        const isFull = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s+[0-9][A-Z]{2}$/i.test(pc);
+        let rows = [];
+
+        if (isFull) {
+            rows = await coll.find({ postcode: pc })
+                .project({ address: 1, district: 1, street: 1, postcode: 1 })
+                .toArray();
+        } else {
+            const escaped = pc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            rows = await coll.find({ postcode: { $regex: `^${escaped}` } })
+                .project({ address: 1, district: 1, street: 1, postcode: 1 })
+                .limit(2000)
+                .toArray();
+        }
 
         const town = rows[0]?.district || '';
 
