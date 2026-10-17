@@ -245,13 +245,19 @@ function normalizePostcode(raw) {
         return outcodeMatch[1];
     }
 
-    // 3. Sector/prefix with explicit space: "DN41 7", "M1 1", "SW1A 1", "DN41 7R"
+    // 3. Sector/prefix with explicit space: "DN41 7", "M1 1", "SW1A 1", "DN41 7R", "SW1A 1A"
     const sectorSpaceMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s+([0-9][A-Z]?)$/i);
     if (sectorSpaceMatch) {
         return `${sectorSpaceMatch[1]} ${sectorSpaceMatch[2]}`;
     }
 
-    // 4. Sector without space (5-6 chars: 4-char outcode + 1-2 char inward prefix, e.g. "DN417", "SW1A1", "AL109")
+    // 4. Partial inward unit without space (outcode + digit + letter, e.g. "M11A" -> "M1 1A", "EH11Y" -> "EH1 1Y", "DN417R" -> "DN41 7R", "SW1A1A" -> "SW1A 1A")
+    const partialUnitNoSpaceMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)([0-9][A-Z])$/i);
+    if (partialUnitNoSpaceMatch) {
+        return `${partialUnitNoSpaceMatch[1]} ${partialUnitNoSpaceMatch[2]}`;
+    }
+
+    // 5. Sector without space (5-6 chars: 4-char outcode + 1-2 char inward prefix, e.g. "DN417", "SW1A1", "AL109")
     const sectorNoSpaceMatch = s.match(/^([A-Z]{2}[0-9]{2}|[A-Z]{1,2}[0-9][A-Z])([0-9][A-Z]?)$/i);
     if (sectorNoSpaceMatch) {
         return `${sectorNoSpaceMatch[1]} ${sectorNoSpaceMatch[2]}`;
@@ -297,8 +303,9 @@ const getPostcodes = async (req, res) => {
         const isFull = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s+[0-9][A-Z]{2}$/i.test(normQ);
         const isSector = !isFull && /^[A-Z]{1,2}[0-9][A-Z0-9]?\s+[0-9][A-Z]?$/i.test(normQ);
         const isOutcode = !isFull && !isSector && /^[A-Z]{1,2}[0-9][A-Z0-9]?$/i.test(normQ);
+        const isAreaPrefix = !isFull && !isSector && !isOutcode && /^[A-Z]{2}$/i.test(normQ);
 
-        if (!isFull && !isSector && !isOutcode) {
+        if (!isFull && !isSector && !isOutcode && !isAreaPrefix) {
             return res.json({
                 postcodes: [],
                 hint: 'Enter a postcode, for example DN41 7 or SW1A 1AA'
@@ -365,7 +372,7 @@ const getPostcodes = async (req, res) => {
             });
         }
 
-        // Prefix range query for sector ("DN41 7") or outcode ("DN41 ")
+        // Prefix range query for sector ("DN41 7"), outcode ("DN41 "), or area prefix ("DN")
         const rangePrefix = isOutcode ? `${normQ} ` : normQ;
         const limit = 120;
 
@@ -373,6 +380,14 @@ const getPostcodes = async (req, res) => {
             postcode: { $gte: rangePrefix, $lt: `${rangePrefix}\uffff` },
             ...activeFilter
         }).project({ postcode: 1, district: 1, _id: 0 }).sort({ postcode: 1 }).limit(limit + 1).toArray();
+
+        // If outcode with trailing space returned 0 rows (e.g. "SW1" where postcodes are "SW1A 1AA", "SW1E..."), search without trailing space
+        if (rows.length === 0 && isOutcode) {
+            rows = await coll.find({
+                postcode: { $gte: normQ, $lt: `${normQ}\uffff` },
+                ...activeFilter
+            }).project({ postcode: 1, district: 1, _id: 0 }).sort({ postcode: 1 }).limit(limit + 1).toArray();
+        }
 
         // Fallback if a 2-digit outcode was typed with a space (e.g. "AL1 0" -> "AL10 ")
         if (rows.length === 0 && /^([A-Z]{1,2}[0-9])\s+([0-9])$/i.test(normQ)) {
@@ -384,7 +399,17 @@ const getPostcodes = async (req, res) => {
             }).project({ postcode: 1, district: 1, _id: 0 }).sort({ postcode: 1 }).limit(limit + 1).toArray();
         }
 
-        const activeRows = rows.filter(r => r.district && r.district.trim().toUpperCase() !== 'NOT ACTIVE');
+        // Fallback to postcode_centroids if postcode_district had 0 active matches (e.g. SW1A 1 / SW1A 1A)
+        if (rows.length === 0 && (isSector || isOutcode)) {
+            const centroidDocs = await db.collection('postcode_centroids').find({
+                postcode: { $gte: rangePrefix, $lt: `${rangePrefix}\uffff` }
+            }).project({ postcode: 1, _id: 0 }).sort({ postcode: 1 }).limit(25).toArray().catch(() => []);
+            if (centroidDocs.length > 0) {
+                rows = centroidDocs.map(c => ({ postcode: c.postcode, district: '' }));
+            }
+        }
+
+        const activeRows = rows.filter(r => !r.district || r.district.trim().toUpperCase() !== 'NOT ACTIVE');
         const truncated = activeRows.length > limit;
         const results = (truncated ? activeRows.slice(0, limit) : activeRows).map(r => ({
             postcode: r.postcode,
@@ -465,6 +490,14 @@ const getStreets = async (req, res) => {
                 postcodes: { $elemMatch: { $gte: rangePrefix, $lt: `${rangePrefix}\uffff` } }
             }).project({ street: 1, display: 1, town: 1 }).limit(MAX_STREETS + 50).maxTimeMS(1500).toArray().catch(() => []);
 
+            // If outcode with space had 0 matches (e.g. "SW1" where postcodes are "SW1A 1AA"), try prefix without space
+            if (dictDocs.length === 0 && !effectivePc.includes(' ')) {
+                dictDocs = await dictColl.find({
+                    type: 'street',
+                    postcodes: { $elemMatch: { $gte: effectivePc, $lt: `${effectivePc}\uffff` } }
+                }).project({ street: 1, display: 1, town: 1 }).limit(MAX_STREETS + 50).maxTimeMS(1500).toArray().catch(() => []);
+            }
+
             // If 2-digit outcode was typed with a space (e.g. "AL1 0" or "DN4 1") and returned 0 docs, try collapsed outcode ("AL10" / "DN41")
             if (dictDocs.length === 0 && /^([A-Z]{1,2}[0-9])\s+([0-9])$/i.test(effectivePc)) {
                 const collapsed = effectivePc.replace(/\s+/g, '');
@@ -526,7 +559,7 @@ const getStreets = async (req, res) => {
 
         const centroid = await getPostcodeCentroid(effectivePc);
 
-        // 3. Fallback to search_dictionary (exact postcode) and local UK Nominatim if streetSet is still empty (e.g. EH1 1YZ)
+        // 3. Fallback to search_dictionary (exact postcode) and local UK Nominatim if streetSet is still empty (e.g. EH1 1YZ, SW1A 1AA)
         if (streetSet.size === 0) {
             if (isFull) {
                 const dictExact = await dictColl.find({
@@ -546,10 +579,10 @@ const getStreets = async (req, res) => {
                     const nomHits = await searchNominatim({ postalcode: effectivePc, limit: 10 });
                     for (const hit of nomHits || []) {
                         const addr = hit.address || {};
-                        const road = addr.road || addr.pedestrian || addr.street || addr.residential || addr.footway || addr.place || '';
+                        const road = addr.road || addr.pedestrian || addr.street || addr.residential || addr.footway || addr.place || addr.building || addr.tourism || addr.amenity || addr.office || addr.historic || '';
                         if (road) streetSet.add(cleanStreetName(road));
                         if (!town) {
-                            town = addr.city || addr.town || addr.village || addr.suburb || addr.county || '';
+                            town = addr.city || addr.town || addr.village || addr.city_district || addr.suburb || addr.county || '';
                         }
                     }
                 } catch (_) {}
@@ -557,13 +590,25 @@ const getStreets = async (req, res) => {
 
             if (streetSet.size === 0 && centroid) {
                 try {
-                    const rev = await reverseNominatim({ lat: centroid.lat, lon: centroid.lon, zoom: 17 });
-                    if (rev && rev.address) {
-                        const addr = rev.address;
-                        const road = addr.road || addr.pedestrian || addr.street || addr.residential || addr.footway || addr.place || addr.suburb || '';
-                        if (road) streetSet.add(cleanStreetName(road));
-                        if (!town) {
-                            town = addr.city || addr.town || addr.village || addr.suburb || addr.county || '';
+                    // Query both zoom 16 (nearest street segment in Nominatim) and zoom 18 (exact building/landmark)
+                    const [revStreet, revBuilding] = await Promise.allSettled([
+                        reverseNominatim({ lat: centroid.lat, lon: centroid.lon, zoom: 16 }),
+                        reverseNominatim({ lat: centroid.lat, lon: centroid.lon, zoom: 18 })
+                    ]);
+
+                    for (const resItem of [revStreet, revBuilding]) {
+                        if (resItem.status === 'fulfilled' && resItem.value) {
+                            const rev = resItem.value;
+                            const addr = rev.address || {};
+                            const road = addr.road || addr.pedestrian || addr.street || addr.residential || addr.footway || addr.place || '';
+                            if (road) streetSet.add(cleanStreetName(road));
+                            const landmark = rev.name || addr.building || addr.tourism || addr.amenity || addr.office || addr.historic || addr.quarter || addr.suburb || '';
+                            if (landmark && landmark.toUpperCase() !== effectivePc) {
+                                streetSet.add(cleanStreetName(landmark));
+                            }
+                            if (!town) {
+                                town = addr.city || addr.town || addr.village || addr.city_district || addr.suburb || addr.county || '';
+                            }
                         }
                     }
                 } catch (_) {}

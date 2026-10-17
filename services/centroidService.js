@@ -39,13 +39,19 @@ function normalizePostcode(raw) {
         return outcodeMatch[1];
     }
 
-    // 3. Sector/prefix with explicit space: "DN41 7", "M1 1", "SW1A 1", "DN41 7R"
+    // 3. Sector/prefix with explicit space: "DN41 7", "M1 1", "SW1A 1", "DN41 7R", "SW1A 1A"
     const sectorSpaceMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s+([0-9][A-Z]?)$/i);
     if (sectorSpaceMatch) {
         return `${sectorSpaceMatch[1]} ${sectorSpaceMatch[2]}`;
     }
 
-    // 4. Sector without space (5-6 chars: 4-char outcode + 1-2 char inward prefix, e.g. "DN417", "SW1A1", "AL109")
+    // 4. Partial inward unit without space (outcode + digit + letter, e.g. "M11A" -> "M1 1A", "EH11Y" -> "EH1 1Y", "DN417R" -> "DN41 7R", "SW1A1A" -> "SW1A 1A")
+    const partialUnitNoSpaceMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)([0-9][A-Z])$/i);
+    if (partialUnitNoSpaceMatch) {
+        return `${partialUnitNoSpaceMatch[1]} ${partialUnitNoSpaceMatch[2]}`;
+    }
+
+    // 5. Sector without space (5-6 chars: 4-char outcode + 1-2 char inward prefix, e.g. "DN417", "SW1A1", "AL109")
     const sectorNoSpaceMatch = s.match(/^([A-Z]{2}[0-9]{2}|[A-Z]{1,2}[0-9][A-Z])([0-9][A-Z]?)$/i);
     if (sectorNoSpaceMatch) {
         return `${sectorNoSpaceMatch[1]} ${sectorNoSpaceMatch[2]}`;
