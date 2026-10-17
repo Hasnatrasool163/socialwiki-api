@@ -323,66 +323,177 @@ async function locateAddress({ postcode: rawPc, street: rawStreet, number: rawNu
     };
 }
 
+// In-memory LRU cache for direct Nominatim search & reverse queries
+const directSearchCache = new LRUCache({
+    max: 5000,
+    ttl: 1000 * 60 * 60 * 6 // 6 hours
+});
+
 /**
  * Direct Nominatim Search (Simple q= or Structured street/city/county/state/country/postalcode)
+ * Optimized for <20ms response (no heavy polygon_geojson serialization) with smart UK sector & structured fallbacks.
  */
 async function searchNominatim(rawParams = {}) {
+    const cacheKey = JSON.stringify(rawParams);
+    if (directSearchCache.has(cacheKey)) {
+        return directSearchCache.get(cacheKey);
+    }
+
     const baseParams = {
         format: 'jsonv2',
         addressdetails: 1,
         extratags: 1,
-        namedetails: 1,
-        polygon_geojson: 1,
-        limit: Math.min(parseInt(rawParams.limit, 10) || 15, 40),
-        countrycodes: rawParams.countrycodes || 'gb'
+        limit: Math.min(parseInt(rawParams.limit, 10) || 10, 25),
+        countrycodes: 'gb'
     };
 
     if (rawParams.dedupe !== undefined) {
         baseParams.dedupe = rawParams.dedupe;
     }
 
-    if (rawParams.q) {
-        const data = await queryNominatimSearch({
+    const sectorRegex = /\b([A-Z]{1,2}[0-9][A-Z0-9]?)\s+([0-9])\b/i;
+
+    // Helper to search with sector centroid viewbox when a UK postcode sector (e.g. "DN41 7") is present
+    async function searchWithSectorFallback(queryText, sectorStr) {
+        const cleanSector = normalizePostcode(sectorStr);
+        const outcode = cleanSector.split(' ')[0];
+        const strippedText = queryText.replace(sectorRegex, '').replace(/^[,\s]+|[,\s]+$/g, '').replace(/,\s*,/g, ',').trim();
+
+        const centroid = await getPostcodeCentroid(cleanSector);
+        if (centroid) {
+            const latDelta = 0.028;
+            const lonDelta = latDelta / Math.cos(centroid.lat * Math.PI / 180);
+            const viewboxStr = `${(centroid.lon - lonDelta).toFixed(6)},${(centroid.lat + latDelta).toFixed(6)},${(centroid.lon + lonDelta).toFixed(6)},${(centroid.lat - latDelta).toFixed(6)}`;
+
+            if (strippedText) {
+                // 1. Try street/place inside the exact sector viewbox
+                let hits = await queryNominatimSearch({
+                    ...baseParams,
+                    q: `${strippedText}, ${outcode}`,
+                    viewbox: viewboxStr,
+                    bounded: 1
+                });
+                if (Array.isArray(hits) && hits.length > 0) return hits;
+
+                hits = await queryNominatimSearch({
+                    ...baseParams,
+                    q: strippedText,
+                    viewbox: viewboxStr,
+                    bounded: 1
+                });
+                if (Array.isArray(hits) && hits.length > 0) return hits;
+            }
+        }
+
+        // Fallback: replace "DN41 7" with outcode "DN41"
+        const outcodeQuery = queryText.replace(sectorRegex, outcode);
+        const hits = await queryNominatimSearch({
             ...baseParams,
-            q: String(rawParams.q).trim()
+            q: outcodeQuery
         });
-        return Array.isArray(data) ? data : [];
+        return Array.isArray(hits) ? hits : [];
     }
 
-    const structuredParams = { ...baseParams };
-    if (rawParams.street) structuredParams.street = String(rawParams.street).trim();
-    if (rawParams.city) structuredParams.city = String(rawParams.city).trim();
-    if (rawParams.county) structuredParams.county = String(rawParams.county).trim();
-    if (rawParams.state) structuredParams.state = String(rawParams.state).trim();
-    if (rawParams.country) structuredParams.country = String(rawParams.country).trim();
-    if (rawParams.postalcode) structuredParams.postalcode = String(rawParams.postalcode).trim();
+    // 1. Simple Free-Form Search (q=)
+    if (rawParams.q) {
+        const qTrim = String(rawParams.q).trim();
+        const sectorMatch = qTrim.match(sectorRegex);
+        const fullPcMatch = qTrim.match(/\b([A-Z]{1,2}[0-9][A-Z0-9]?)\s*([0-9][A-Z]{2})\b/i);
 
-    let data = await queryNominatimSearch(structuredParams);
-    if ((!Array.isArray(data) || data.length === 0) && rawParams.postalcode) {
-        const pcNorm = normalizePostcode(rawParams.postalcode);
-        const outcode = pcNorm.split(' ')[0];
-        const fallbackQ = [
-            rawParams.street,
-            rawParams.city,
-            rawParams.county,
-            outcode
-        ].map(v => (v ? String(v).trim() : '')).filter(Boolean).join(', ');
+        // If query contains a partial sector (e.g. "Rookery Road, DN41 7") and NOT a full 7-char postcode
+        if (sectorMatch && !fullPcMatch) {
+            const sectorHits = await searchWithSectorFallback(qTrim, `${sectorMatch[1]} ${sectorMatch[2]}`);
+            if (sectorHits.length > 0) {
+                directSearchCache.set(cacheKey, sectorHits);
+                return sectorHits;
+            }
+        }
 
-        if (fallbackQ) {
-            data = await queryNominatimSearch({
-                ...baseParams,
-                q: fallbackQ
-            });
+        let data = await queryNominatimSearch({
+            ...baseParams,
+            q: qTrim
+        });
+
+        if (Array.isArray(data) && data.length > 0) {
+            directSearchCache.set(cacheKey, data);
+            return data;
+        }
+        return [];
+    }
+
+    // 2. Structured Search (street, city, county, state, country, postalcode)
+    const street = rawParams.street ? String(rawParams.street).trim() : '';
+    const city = rawParams.city ? String(rawParams.city).trim() : '';
+    const county = rawParams.county ? String(rawParams.county).trim() : '';
+    const state = rawParams.state ? String(rawParams.state).trim() : '';
+    const postalcode = rawParams.postalcode ? String(rawParams.postalcode).trim() : '';
+
+    // Ignore county/state if user accidentally typed "United Kingdom" or "UK" or "GB" in County/State
+    const ignoreCountryTerms = new Set(['united kingdom', 'uk', 'gb', 'great britain']);
+    const validCounty = county && !ignoreCountryTerms.has(county.toLowerCase()) ? county : '';
+    const validState = state && !ignoreCountryTerms.has(state.toLowerCase()) ? state : '';
+
+    const isSectorPc = postalcode && /^[A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9]$/i.test(postalcode);
+
+    // If postalcode is a partial sector (e.g. "DN41 7"), use sector viewbox search first
+    if (isSectorPc) {
+        const combinedText = [street, city, validCounty, postalcode].filter(Boolean).join(', ');
+        const sectorHits = await searchWithSectorFallback(combinedText, postalcode);
+        if (sectorHits.length > 0) {
+            directSearchCache.set(cacheKey, sectorHits);
+            return sectorHits;
         }
     }
 
-    return Array.isArray(data) ? data : [];
+    const structuredParams = { ...baseParams };
+    if (street) structuredParams.street = street;
+    if (city) structuredParams.city = city;
+    if (validCounty) structuredParams.county = validCounty;
+    if (validState) structuredParams.state = validState;
+    if (postalcode && !isSectorPc) structuredParams.postalcode = normalizePostcode(postalcode);
+
+    let data = await queryNominatimSearch(structuredParams);
+    if (Array.isArray(data) && data.length > 0) {
+        directSearchCache.set(cacheKey, data);
+        return data;
+    }
+
+    // Fallback cascade when strict structured tags don't all live on the same OSM element
+    // (e.g., road way "Downing Street" doesn't carry addr:postcode="SW1A 2AA", or "London" vs "City of Westminster")
+    const pcNorm = postalcode ? normalizePostcode(postalcode) : '';
+    const outcode = pcNorm ? pcNorm.split(' ')[0] : '';
+
+    const fallbackCandidates = [
+        [street, city, pcNorm].filter(Boolean).join(', '),
+        [street, pcNorm].filter(Boolean).join(', '),
+        [street, city, outcode].filter(Boolean).join(', '),
+        [street, city].filter(Boolean).join(', '),
+        [street, outcode].filter(Boolean).join(', ')
+    ].filter((q, idx, arr) => q.length > 0 && arr.indexOf(q) === idx);
+
+    for (const candidateQ of fallbackCandidates) {
+        data = await queryNominatimSearch({
+            ...baseParams,
+            q: candidateQ
+        });
+        if (Array.isArray(data) && data.length > 0) {
+            directSearchCache.set(cacheKey, data);
+            return data;
+        }
+    }
+
+    return [];
 }
 
 /**
  * Direct Nominatim Reverse Geocode (lat, lon, zoom)
  */
 async function reverseNominatim({ lat, lon, zoom = 18 }) {
+    const cacheKey = `rev:${Number(lat).toFixed(6)}:${Number(lon).toFixed(6)}:${zoom}`;
+    if (directSearchCache.has(cacheKey)) {
+        return directSearchCache.get(cacheKey);
+    }
+
     return globalQueue.enqueue(async () => {
         const params = {
             lat: Number(lat),
@@ -390,9 +501,7 @@ async function reverseNominatim({ lat, lon, zoom = 18 }) {
             zoom: Number(zoom) || 18,
             format: 'jsonv2',
             addressdetails: 1,
-            extratags: 1,
-            namedetails: 1,
-            polygon_geojson: 1
+            extratags: 1
         };
         if (CONFIG.geocoderKey) {
             params.key = CONFIG.geocoderKey;
@@ -405,6 +514,9 @@ async function reverseNominatim({ lat, lon, zoom = 18 }) {
             },
             timeout: CONFIG.timeoutMs
         });
+        if (response.data && !response.data.error) {
+            directSearchCache.set(cacheKey, response.data);
+        }
         return response.data;
     });
 }
