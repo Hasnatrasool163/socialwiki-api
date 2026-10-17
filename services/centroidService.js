@@ -23,35 +23,39 @@ const centroidCache = new LRUCache({
  */
 function normalizePostcode(raw) {
     if (!raw) return '';
-    const s = String(raw).trim().toUpperCase();
+    const s = String(raw).trim().toUpperCase().replace(/[^A-Z0-9\s]/g, '').replace(/\s+/g, ' ');
+    if (!s) return '';
 
-    // 1. Full postcode: "DN41 7RU" or "DN417RU"
+    // 1. Full postcode: "DN41 7RU" or "DN417RU" (always ends in digit + 2 letters)
     const fullMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s*([0-9][A-Z]{2})$/i);
     if (fullMatch) {
         return `${fullMatch[1]} ${fullMatch[2]}`;
     }
 
-    // 2. Sector: "DN41 7" or "DN417"
-    const sectorMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s*([0-9])$/i);
-    if (sectorMatch) {
-        return `${sectorMatch[1]} ${sectorMatch[2]}`;
-    }
-
-    // 3. Outcode only: "DN41"
+    // 2. Outcode only (2-4 chars, NO space): "DN41", "AL10", "M11", "SW1A", "M1"
+    // Checked BEFORE sector rules so "DN41" or "AL10" is never split into "DN4 1" or "AL1 0"
     const outcodeMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)$/i);
     if (outcodeMatch) {
         return outcodeMatch[1];
     }
 
-    const clean = s.replace(/[^A-Z0-9]/g, '');
-    if (clean.length > 3) {
-        return `${clean.slice(0, -3)} ${clean.slice(-3)}`;
+    // 3. Sector/prefix with explicit space: "DN41 7", "M1 1", "SW1A 1", "DN41 7R"
+    const sectorSpaceMatch = s.match(/^([A-Z]{1,2}[0-9][A-Z0-9]?)\s+([0-9][A-Z]?)$/i);
+    if (sectorSpaceMatch) {
+        return `${sectorSpaceMatch[1]} ${sectorSpaceMatch[2]}`;
     }
-    return clean;
+
+    // 4. Sector without space (5-6 chars: 4-char outcode + 1-2 char inward prefix, e.g. "DN417", "SW1A1", "AL109")
+    const sectorNoSpaceMatch = s.match(/^([A-Z]{2}[0-9]{2}|[A-Z]{1,2}[0-9][A-Z])([0-9][A-Z]?)$/i);
+    if (sectorNoSpaceMatch) {
+        return `${sectorNoSpaceMatch[1]} ${sectorNoSpaceMatch[2]}`;
+    }
+
+    return s;
 }
 
 /**
- * Retrieve centroid { lat, lon } for a given UK postcode or sector
+ * Retrieve centroid { lat, lon } for a given UK postcode, sector, or outcode
  */
 async function getPostcodeCentroid(rawPostcode) {
     const pc = normalizePostcode(rawPostcode);
@@ -63,11 +67,20 @@ async function getPostcodeCentroid(rawPostcode) {
     }
 
     try {
-        // 2. MongoDB check (exact match or sector prefix)
+        // 2. MongoDB check (exact match or indexed range prefix)
         let doc = await PostcodeCentroid.findOne({ postcode: pc }).lean();
         if (!doc) {
-            const escaped = pc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            doc = await PostcodeCentroid.findOne({ postcode: { $regex: `^${escaped}` } }).lean();
+            const rangePrefix = pc.includes(' ') ? pc : `${pc} `;
+            doc = await PostcodeCentroid.findOne({
+                postcode: { $gte: rangePrefix, $lt: `${rangePrefix}\uffff` }
+            }).lean();
+        }
+        // Fallback if a 2-digit outcode was typed with a space (e.g. "AL1 0" -> "AL10 ")
+        if (!doc && /^([A-Z]{1,2}[0-9])\s+([0-9])$/i.test(pc)) {
+            const collapsed = pc.replace(/\s+/g, '');
+            doc = await PostcodeCentroid.findOne({
+                postcode: { $gte: `${collapsed} `, $lt: `${collapsed} \uffff` }
+            }).lean();
         }
 
         if (doc && typeof doc.lat === 'number' && typeof doc.lon === 'number') {
