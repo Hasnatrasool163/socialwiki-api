@@ -19,7 +19,7 @@ const SearchEvent = require('../models/SearchEvent');
 const UsageDaily = require('../models/UsageDaily');
 const logger = require('../config/logger');
 const { getPostcodeCentroid } = require('../services/centroidService');
-const { locateAddress } = require('../services/geocoderService');
+const { locateAddress, searchNominatim, reverseNominatim } = require('../services/geocoderService');
 
 // Fixed unit hint labels in priority order (Phase 3 addendum)
 const STRUCTURAL_HINT_DEFINITIONS = [
@@ -800,6 +800,56 @@ const getAreas = async (req, res) => {
     }
 };
 
+// ============================================================================
+// 6. GET /api/rm/nominatim-search (Direct self-hosted Nominatim UK search)
+// ============================================================================
+const nominatimSearch = async (req, res) => {
+    try {
+        const { q, street, city, county, state, country, postalcode, limit } = req.query;
+        const hasInput = [q, street, city, county, state, postalcode].some(v => v && String(v).trim().length > 0);
+        if (!hasInput) {
+            return res.json({ results: [] });
+        }
+
+        const results = await searchNominatim({
+            q: sanitizeInput(q, 160),
+            street: sanitizeInput(street, 100),
+            city: sanitizeInput(city, 60),
+            county: sanitizeInput(county, 60),
+            state: sanitizeInput(state, 60),
+            country: sanitizeInput(country || 'United Kingdom', 60),
+            postalcode: sanitizeInput(postalcode, 20),
+            limit
+        });
+
+        return res.json({ results });
+    } catch (err) {
+        logger.error(`nominatimSearch error: ${err.message}`);
+        return res.status(500).json({ error: 'Map search failed', results: [] });
+    }
+};
+
+// ============================================================================
+// 7. GET /api/rm/nominatim-reverse (Direct self-hosted Nominatim UK reverse)
+// ============================================================================
+const nominatimReverse = async (req, res) => {
+    try {
+        const lat = parseFloat(req.query.lat);
+        const lon = parseFloat(req.query.lon);
+        const zoom = parseInt(req.query.zoom, 10) || 18;
+
+        if (isNaN(lat) || isNaN(lon)) {
+            return res.status(400).json({ error: 'Valid latitude and longitude are required' });
+        }
+
+        const result = await reverseNominatim({ lat, lon, zoom });
+        return res.json({ result });
+    } catch (err) {
+        logger.error(`nominatimReverse error: ${err.message}`);
+        return res.status(500).json({ error: 'Reverse lookup failed' });
+    }
+};
+
 module.exports = {
     getPostcodes,
     getStreets,
@@ -807,6 +857,8 @@ module.exports = {
     locateAddress: locateAddressHandler,
     findBusiness,
     getAreas,
+    nominatimSearch,
+    nominatimReverse,
     parseAddressRow,
     cleanStreetName,
     normalizePostcode
