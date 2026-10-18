@@ -480,18 +480,22 @@ async function ensureCentroidsSeededFromPostgres(centroidColl) {
 
     const sql = `SELECT UPPER(TRIM(postcode)), ROUND(ST_Y(ST_Centroid(geometry))::numeric, 6), ROUND(ST_X(ST_Centroid(geometry))::numeric, 6) FROM location_postcode WHERE country_code = 'gb' AND postcode IS NOT NULL;`;
 
-    // Try standard local Postgres invocations used by Nominatim on Ubuntu
+    const pgPass = process.env.PGPASSWORD || 'nominatim_local_pass';
     const candidateCommands = [
-        ['psql', ['-d', 'nominatim', '-t', '-A', '-F', ',', '-c', sql]],
-        ['psql', ['-h', '127.0.0.1', '-U', 'nominatim', '-d', 'nominatim', '-t', '-A', '-F', ',', '-c', sql]],
-        ['sudo', ['-n', '-u', 'nominatim', 'psql', '-d', 'nominatim', '-t', '-A', '-F', ',', '-c', sql]],
-        ['sudo', ['-n', '-u', 'postgres', 'psql', '-d', 'nominatim', '-t', '-A', '-F', ',', '-c', sql]]
+        ['psql', ['-h', '127.0.0.1', '-U', 'nominatim', '-d', 'nominatim', '-t', '-A', '-F', ',', '-c', sql], { PGPASSWORD: pgPass }],
+        ['psql', [`postgresql://nominatim:${pgPass}@127.0.0.1:5432/nominatim`, '-t', '-A', '-F', ',', '-c', sql], {}],
+        ['psql', ['-d', 'nominatim', '-t', '-A', '-F', ',', '-c', sql], { PGPASSWORD: pgPass }],
+        ['sudo', ['-n', '-u', 'postgres', 'psql', '-d', 'nominatim', '-t', '-A', '-F', ',', '-c', sql], {}],
+        ['sudo', ['-n', '-u', 'nominatim', 'psql', '-d', 'nominatim', '-t', '-A', '-F', ',', '-c', sql], {}]
     ];
 
-    for (const [cmd, args] of candidateCommands) {
+    for (const [cmd, args, extraEnv] of candidateCommands) {
         try {
             const imported = await new Promise((resolve, reject) => {
-                const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+                const proc = spawn(cmd, args, {
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    env: { ...process.env, ...extraEnv }
+                });
                 let errOutput = '';
                 proc.stderr.on('data', d => { errOutput += d.toString(); });
 
