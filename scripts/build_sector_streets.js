@@ -80,25 +80,86 @@ const DIRECTIONAL_WORDS = new Set([
 const FLOOR_PART_REGEX = /^(?:(?:ground|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|[0-9]+(?:st|nd|rd|th)|lower\s+ground|upper\s+ground|street|top|middle|main|sub)\s+(?:floor|level)(?:\s+(?:north|south|east|west|left|right|front|rear|wing))?|basement|sub-basement|mezzanine|penthouse|annexe|annex|attic|cellar|[0-9]\/[a-z0-9]|[a-z]\/[a-z0-9]|[0-9]f[0-9]|pf[0-9]|bf[0-9]|gf|ff|sf|tf)$/i;
 const UNIT_PART_REGEX = /^(?:flat|unit|room|apartment|apt|suite|studio|block)\b(?:\s+[a-z0-9\/-]+)?$/i;
 
+const ABBREV_MAP = {
+    'st': 'street',
+    'rd': 'road',
+    'ave': 'avenue',
+    'av': 'avenue',
+    'ln': 'lane',
+    'dr': 'drive',
+    'cl': 'close',
+    'ct': 'court',
+    'pl': 'place',
+    'sq': 'square',
+    'ter': 'terrace',
+    'terr': 'terrace',
+    'cres': 'crescent',
+    'gdns': 'gardens',
+    'gdn': 'gardens',
+    'pk': 'park',
+    'gt': 'gate',
+    'mt': 'mount',
+    'bvd': 'boulevard',
+    'blvd': 'boulevard',
+    'hwy': 'highway',
+    'ch': 'chase',
+    'gr': 'grove',
+    'vw': 'view',
+    'wk': 'walk',
+    'wy': 'way'
+};
+
 function cleanStreetName(s) {
     if (!s) return '';
     return s.replace(/\s+/g, ' ').replace(/^[\s,.-]+|[\s,.-]+$/g, '').trim();
 }
 
-function normalizeStreetKey(s, expandSaint = false) {
+function normalizeStreetKey(s, expandStAsSaint = false) {
     if (!s) return '';
-    let k = s.toLowerCase()
-        .replace(/['’`.]/g, '')
-        .replace(/&/g, 'and')
-        .replace(/[^a-z0-9\s]/g, ' ')
+    let lower = s.toLowerCase()
+        .replace(/['’`.,-]/g, ' ')
+        .replace(/\bmarishal\b/g, 'marischal')
+        .replace(/\bsaint\b/g, 'st')
         .replace(/\s+/g, ' ')
         .trim();
-    if (expandSaint) {
-        k = k.replace(/^st\s+/, 'saint ')
-             .replace(/\bst\s+/, 'saint ')
-             .replace(/^st\b/, 'saint');
+
+    const words = lower.split(' ').filter(Boolean);
+    if (words.length > 1 && words[0] === 'the') {
+        words.shift();
     }
-    return k;
+
+    const mapped = words.map((w, idx) => {
+        if (w === 'st') {
+            if (expandStAsSaint || idx < words.length - 1) return 'saint';
+            return 'street';
+        }
+        return ABBREV_MAP[w] || w;
+    });
+
+    return mapped.join(' ');
+}
+
+function streetsMatch(rmStreet, osmStreet) {
+    if (!rmStreet || !osmStreet) return { match: false, type: 'none' };
+    const rmClean = rmStreet.toLowerCase().trim();
+    const osmClean = osmStreet.toLowerCase().trim();
+    if (rmClean === osmClean) {
+        return { match: true, type: 'exact' };
+    }
+    const k1 = normalizeStreetKey(rmStreet, false);
+    const k2 = normalizeStreetKey(osmStreet, false);
+    if (k1 && k1 === k2) {
+        return { match: true, type: 'variant' };
+    }
+    const k1Saint = normalizeStreetKey(rmStreet, true);
+    const k2Saint = normalizeStreetKey(osmStreet, true);
+    if (k1Saint && k1Saint === k2Saint) {
+        return { match: true, type: 'variant' };
+    }
+    if (k1.length >= 5 && k2.length >= 5 && (k1.includes(k2) || k2.includes(k1))) {
+        return { match: true, type: 'variant' };
+    }
+    return { match: false, type: 'none' };
 }
 
 function hasThoroughfareEnding(part) {
@@ -229,20 +290,36 @@ async function verifyStreetWithNominatim(streetName, postcodes, centroidMap, out
 
     const checkHit = (hit) => {
         const addr = hit.address || {};
-        const road = addr.road || addr.pedestrian || addr.street || addr.residential || addr.footway || hit.name || '';
-        const normRoad = normalizeStreetKey(road, false);
-        const normRoadSaint = normalizeStreetKey(road, true);
+        const roadCandidates = [
+            addr.road,
+            addr.pedestrian,
+            addr.street,
+            addr.residential,
+            addr.footway,
+            addr.path,
+            addr.place,
+            addr.suburb,
+            addr.neighbourhood,
+            hit.name
+        ].filter(Boolean);
 
-        let matchType = null;
-        if (normRoad && normRoad === normTarget) {
-            matchType = 'exact';
-        } else if (normRoadSaint && normRoadSaint === normTargetSaint) {
-            matchType = 'variant';
-        } else if (normRoad.length >= 6 && normTarget.length >= 6 && (normRoad.includes(normTarget) || normTarget.includes(normRoad))) {
-            matchType = 'variant';
+        if (hit.display_name) {
+            const firstPart = hit.display_name.split(',')[0].trim();
+            if (firstPart && !roadCandidates.includes(firstPart)) {
+                roadCandidates.push(firstPart);
+            }
         }
 
-        if (matchType) {
+        let bestMatch = null;
+        for (const rc of roadCandidates) {
+            const cmp = streetsMatch(streetName, rc);
+            if (cmp.match) {
+                bestMatch = cmp.type;
+                if (cmp.type === 'exact') break;
+            }
+        }
+
+        if (bestMatch) {
             const hLat = parseFloat(hit.lat);
             const hLon = parseFloat(hit.lon);
             let minDistance = coords.length === 0 ? 0 : 999999;
@@ -252,7 +329,7 @@ async function verifyStreetWithNominatim(streetName, postcodes, centroidMap, out
             }
             return {
                 matched: true,
-                matchType,
+                matchType: bestMatch,
                 osmId: hit.osm_id || hit.place_id,
                 osmClass: hit.class || 'highway',
                 osmType: hit.type || 'road',
