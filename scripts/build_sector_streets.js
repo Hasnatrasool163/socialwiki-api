@@ -220,9 +220,9 @@ function calculateBoundingBox(coords, paddingMeters = 250) {
 /**
  * Verifies a single street against local Nominatim using multi-postcode bounding box.
  */
-async function verifyStreetWithNominatim(streetName, postcodes, centroidMap) {
+async function verifyStreetWithNominatim(streetName, postcodes, centroidMap, outcode = '', town = '') {
     const coords = postcodes.map(pc => centroidMap.get(pc)).filter(Boolean);
-    const bbox = calculateBoundingBox(coords, 250);
+    const bbox = calculateBoundingBox(coords, 2500);
 
     const normTarget = normalizeStreetKey(streetName, false);
     const normTargetSaint = normalizeStreetKey(streetName, true);
@@ -245,7 +245,7 @@ async function verifyStreetWithNominatim(streetName, postcodes, centroidMap) {
         if (matchType) {
             const hLat = parseFloat(hit.lat);
             const hLon = parseFloat(hit.lon);
-            let minDistance = 999999;
+            let minDistance = coords.length === 0 ? 0 : 999999;
             for (const c of coords) {
                 const d = haversineDistanceMeters(c.lat, c.lon, hLat, hLon);
                 if (d < minDistance) minDistance = d;
@@ -263,46 +263,61 @@ async function verifyStreetWithNominatim(streetName, postcodes, centroidMap) {
         return null;
     };
 
+    const stExpanded = streetName.replace(/\bSt\.?\s+/gi, 'Saint ').replace(/\bSt\.?$/gi, 'Street');
+
+    const queries = [];
+    if (outcode) queries.push({ q: `${streetName}, ${outcode}` });
+    if (town) queries.push({ q: `${streetName}, ${town}` });
+    queries.push({ street: streetName });
+    queries.push({ q: streetName });
+    if (stExpanded !== streetName) {
+        if (outcode) queries.push({ q: `${stExpanded}, ${outcode}` });
+        queries.push({ q: stExpanded });
+    }
+
     // 1. First attempt: bounded search in postcode viewbox
-    if (bbox) {
+    for (const qObj of queries) {
         try {
-            const res = await httpClient.get('/search', {
-                params: {
-                    street: streetName,
-                    viewbox: bbox.viewbox,
-                    bounded: 1,
-                    format: 'jsonv2',
-                    addressdetails: 1,
-                    countrycodes: 'gb',
-                    limit: 5
-                }
-            });
+            const params = {
+                ...qObj,
+                format: 'jsonv2',
+                addressdetails: 1,
+                countrycodes: 'gb',
+                limit: 5
+            };
+            if (bbox) {
+                params.viewbox = bbox.viewbox;
+                params.bounded = 1;
+            }
+            const res = await httpClient.get('/search', { params });
             for (const hit of res.data || []) {
                 const match = checkHit(hit);
-                if (match && match.distanceM <= 800) return match;
+                if (match && (match.distanceM <= 3500 || coords.length === 0)) return match;
             }
         } catch (_) {}
     }
 
     // 2. Second attempt: unbounded search biased by viewbox
     if (bbox) {
-        try {
-            const res = await httpClient.get('/search', {
-                params: {
-                    street: streetName,
-                    viewbox: bbox.viewbox,
-                    bounded: 0,
-                    format: 'jsonv2',
-                    addressdetails: 1,
-                    countrycodes: 'gb',
-                    limit: 5
+        for (const qObj of queries.slice(0, 2)) {
+            try {
+                const res = await httpClient.get('/search', {
+                    params: {
+                        ...qObj,
+                        viewbox: bbox.viewbox,
+                        bounded: 0,
+                        format: 'jsonv2',
+                        addressdetails: 1,
+                        countrycodes: 'gb',
+                        limit: 5
+                    }
+                });
+                for (const hit of res.data || []) {
+                    const match = checkHit(hit);
+                    if (match && match.distanceM <= 4500) return match;
                 }
-            });
-            for (const hit of res.data || []) {
-                const match = checkHit(hit);
-                if (match && match.distanceM <= 1200) return match;
-            }
-        } catch (_) {}
+            } catch (_) {}
+        }
     }
 
     return { matched: false, matchType: 'osm_gap', osmId: null, distanceM: null };
@@ -383,7 +398,7 @@ async function processOutcode(outcode, db) {
         const sectorsArr = Array.from(st.sectors);
         const primarySector = sectorsArr[0] || `${outcode} 0`;
 
-        const verResult = await verifyStreetWithNominatim(st.display, postcodesArr, centroidMap);
+        const verResult = await verifyStreetWithNominatim(st.display, postcodesArr, centroidMap, outcode, dominantTown);
 
         const isVerified = verResult.matched;
         if (isVerified) verifiedCount++;
