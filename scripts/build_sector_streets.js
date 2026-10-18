@@ -509,11 +509,19 @@ async function main() {
         process.exit(0);
     }
 
+    const isForce = args.includes('--force');
+
     console.log(`Found ${targetOutcodes.length} outcodes to process.`);
 
     // Check completed outcodes for checkpoint resume
-    const completedDocs = await progressColl.find({ status: 'completed' }).project({ outcode: 1, _id: 0 }).toArray();
-    const completedSet = new Set(completedDocs.map(d => d.outcode));
+    let completedSet = new Set();
+    if (!isForce) {
+        const completedDocs = await progressColl.find({ status: 'completed' }).project({ outcode: 1, _id: 0 }).toArray();
+        completedSet = new Set(completedDocs.map(d => d.outcode));
+    } else {
+        console.log('Mode: --force specified, re-processing target outcodes.');
+        await progressColl.deleteMany({ outcode: { $in: targetOutcodes } });
+    }
 
     const remainingOutcodes = targetOutcodes.filter(o => !completedSet.has(o));
     console.log(`${completedSet.size} outcodes already completed. ${remainingOutcodes.length} remaining.`);
