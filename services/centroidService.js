@@ -95,36 +95,36 @@ async function getPostcodeCentroid(rawPostcode) {
             return centroid;
         }
 
-        // 3. Fallback to api.postcodes.io
-        const isFull = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s+[0-9][A-Z]{2}$/i.test(pc);
-        const outcode = pc.split(' ')[0];
-        const url = isFull
-            ? `https://api.postcodes.io/postcodes/${encodeURIComponent(pc)}`
-            : `https://api.postcodes.io/outcodes/${encodeURIComponent(outcode)}`;
+        // 3. Fallback to local self-hosted UK Nominatim (127.0.0.1:8088) — no external API calls
+        const nominatimBase = (process.env.NOMINATIM_URL || 'http://127.0.0.1:8088').replace(/\/+$/, '');
+        const resp = await axios.get(`${nominatimBase}/search`, {
+            params: {
+                postalcode: pc,
+                countrycodes: 'gb',
+                format: 'jsonv2',
+                limit: 1
+            },
+            timeout: 1500
+        });
 
-        const resp = await axios.get(url, { timeout: 2000 });
+        if (Array.isArray(resp.data) && resp.data.length > 0 && resp.data[0].lat && resp.data[0].lon) {
+            const lat = parseFloat(resp.data[0].lat);
+            const lon = parseFloat(resp.data[0].lon);
+            if (!isNaN(lat) && !isNaN(lon)) {
+                const source = 'os_codepoint_open';
+                const centroid = { lat, lon, source };
+                centroidCache.set(pc, centroid);
 
-        if (resp.data && resp.data.result && typeof resp.data.result.latitude === 'number') {
-            const lat = resp.data.result.latitude;
-            const lon = resp.data.result.longitude;
-            const eastings = resp.data.result.eastings || null;
-            const northings = resp.data.result.northings || null;
-            const isBT = pc.startsWith('BT');
-            const source = isBT ? 'osni_postcodes_io' : (isFull ? 'postcodes_io_ogl' : 'postcodes_io_outcode');
+                PostcodeCentroid.findOneAndUpdate(
+                    { postcode: pc },
+                    { postcode: pc, lat, lon, source },
+                    { upsert: true, new: true }
+                ).catch(err => {
+                    logger.warn(`Failed to cache centroid in MongoDB for ${pc}: ${err.message}`);
+                });
 
-            const centroid = { lat, lon, source };
-            centroidCache.set(pc, centroid);
-
-            // Async background save to MongoDB (do not block)
-            PostcodeCentroid.findOneAndUpdate(
-                { postcode: pc },
-                { postcode: pc, lat, lon, eastings, northings, source },
-                { upsert: true, new: true }
-            ).catch(err => {
-                logger.warn(`Failed to cache centroid in MongoDB for ${pc}: ${err.message}`);
-            });
-
-            return centroid;
+                return centroid;
+            }
         }
     } catch (err) {
         logger.debug(`Centroid resolution note for ${pc}: ${err.message}`);

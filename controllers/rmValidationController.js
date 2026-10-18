@@ -117,105 +117,182 @@ const THOROUGHFARE_WORDS = new Set([
     'piccadilly', 'whitehall', 'cheapside', 'cornhill'
 ]);
 
-const UNIT_WORD_REGEX = /^(?:flat|unit|room|apartment|suite)\b(?:\s+[a-z0-9\/-]+)?$/i;
-const FLOOR_WORD_REGEX = /^(?:ground\s+floor|first\s+floor|second\s+floor|third\s+floor|basement|annexe|[0-9]\/[a-z]|[a-z]\/[a-z])$/i;
+const DIRECTIONAL_WORDS = new Set([
+    'north', 'south', 'east', 'west', 'upper', 'lower', 'central', 'inner', 'outer'
+]);
+
+const UNIT_WORD_REGEX = /^(?:flat|unit|room|apartment|apt|suite|studio|block)\b(?:\s+[a-z0-9\/-]+)?$/i;
+const FLOOR_PART_REGEX = /\b(?:ground\s+floor|first\s+floor|second\s+floor|third\s+floor|fourth\s+floor|[0-9]+(?:st|nd|rd|th)\s+floor|street\s+floor(?:\s+(?:north|south|east|west))?|basement|lower\s+ground\s+floor|upper\s+ground\s+floor|mezzanine|penthouse|annexe|[0-9]\/[a-z]|[a-z]\/[a-z]|[0-9]f[0-9]|pf[0-9]|bf[0-9])$/i;
+
+function hasThoroughfareEnding(part) {
+    if (!part) return false;
+    const words = part.trim().replace(/[.,]/g, '').split(/\s+/).filter(Boolean);
+    if (!words.length) return false;
+    const last = words[words.length - 1].toLowerCase();
+    if (THOROUGHFARE_WORDS.has(last)) return true;
+    if (words.length >= 2 && DIRECTIONAL_WORDS.has(last)) {
+        const prev = words[words.length - 2].toLowerCase();
+        if (THOROUGHFARE_WORDS.has(prev)) return true;
+    }
+    return false;
+}
 
 /**
- * Section 6.2 Address Parser Rules
- * Derives street name and premises from an address row.
+ * Section 6.2 Address Parser v2
+ * Derives street name, candidate street parts, and premises from an address row.
+ * Handles:
+ * - PO Box anywhere in row
+ * - Floor/unit labels anywhere in parts (e.g. "6th Floor", "Street Floor South")
+ * - Number ranges with letters on both sides (e.g. "7-21a St. Nicholas Street")
+ * - Trailing directionals (e.g. "Marischal Square West")
+ * - Multi-part candidate extraction without concatenating house names onto street names
  */
-function parseAddressRow(rawAddress) {
+function parseAddressRow(rawAddress, verifiedRoadSet = null) {
     if (!rawAddress || typeof rawAddress !== 'string') return null;
-    const parts = rawAddress.split(',').map(p => p.trim()).filter(Boolean);
-    if (!parts.length) return null;
+    const rawParts = rawAddress.split(',').map(p => p.trim()).filter(Boolean);
+    if (!rawParts.length) return null;
 
-    // Rule 5: Skip PO Box rows
-    if (/^po\s+box\b/i.test(parts[0])) return null;
+    // Skip PO Box rows anywhere in the address
+    if (rawParts.some(p => /\bpo\s*box\b/i.test(p))) return null;
 
-    // Rule 2: Drop unit-only parts from leading positions
-    let idx = 0;
+    // Filter out pure unit/floor parts from any position while recording unit prompt
     let detectedUnitPrompt = null;
-    while (idx < parts.length) {
-        const p = parts[idx];
-        const unitMatch = p.match(/^(flat|unit|room|apartment|suite)\b/i);
-        if (unitMatch) {
+    const remaining = [];
+
+    for (const p of rawParts) {
+        const unitMatch = p.match(/^(flat|unit|room|apartment|apt|suite|studio|block)\b/i);
+        if (unitMatch && !hasThoroughfareEnding(p)) {
             if (!detectedUnitPrompt) detectedUnitPrompt = unitMatch[1];
-            idx++;
-        } else if (FLOOR_WORD_REGEX.test(p)) {
+            continue;
+        }
+        if (FLOOR_PART_REGEX.test(p) && !hasThoroughfareEnding(p)) {
             if (!detectedUnitPrompt) detectedUnitPrompt = p;
-            idx++;
-        } else {
+            continue;
+        }
+        // Check inline flat prefix on numbered street part (e.g. "Flat 2 14 High Street")
+        const inlineFlat = p.match(/^((?:flat|unit|apt|apartment|room|suite)\s+[0-9a-z\/-]+)\s+(\d+[a-z]?(?:-\d+[a-z]?)?\s+.+)$/i);
+        if (inlineFlat) {
+            if (!detectedUnitPrompt) detectedUnitPrompt = inlineFlat[1];
+            remaining.push(inlineFlat[2]);
+            continue;
+        }
+        remaining.push(p);
+    }
+
+    if (!remaining.length) return null;
+
+    // Build candidate parts (with leading numbers extracted where present)
+    const parsedParts = remaining.map((part, idx) => {
+        // Match leading number or range with optional letters on both sides (e.g. "7-21a", "10a-12b", "101")
+        const numMatch = part.match(/^(\d+[a-z]?(?:-\d+[a-z]?)?)\s+(.+)$/i);
+        if (numMatch && !/^(?:\d+(?:st|nd|rd|th))$/i.test(numMatch[1])) {
+            return {
+                idx,
+                raw: part,
+                numberPart: numMatch[1],
+                text: cleanStreetName(numMatch[2]),
+                isThoroughfare: hasThoroughfareEnding(numMatch[2])
+            };
+        }
+        return {
+            idx,
+            raw: part,
+            numberPart: null,
+            text: cleanStreetName(part),
+            isThoroughfare: hasThoroughfareEnding(part)
+        };
+    });
+
+    // Handle standalone number before comma (e.g. "354, Castlehill")
+    for (let i = 0; i < parsedParts.length - 1; i++) {
+        const m = parsedParts[i].raw.match(/^(\d+[a-z]?(?:-\d+[a-z]?)?)$/i);
+        if (m && !/^(?:\d+(?:st|nd|rd|th))$/i.test(m[1])) {
+            parsedParts[i + 1].numberPart = m[1];
+            parsedParts.splice(i, 1);
             break;
         }
     }
 
-    const remaining = parts.slice(idx);
-    if (!remaining.length) return null;
+    const candidates = parsedParts.map(p => p.text).filter(Boolean);
 
-    // Rule 3: Anchor on first part with leading house number or range
-    for (let i = 0; i < remaining.length; i++) {
-        const part = remaining[i];
-        const numMatch = part.match(/^(\d+(?:[a-z]|-\d+)?)\s+(.+)$/i);
-        if (numMatch) {
-            const leadNum = numMatch[1];
-            // Ensure word boundary so "2nd Avenue" is not treated as house number 2
-            if (!/^(?:\d+(?:st|nd|rd|th))$/i.test(leadNum)) {
-                const street = [numMatch[2], ...remaining.slice(i + 1)].join(', ');
-                return {
-                    street: cleanStreetName(street),
-                    numberPart: leadNum,
-                    premises: remaining.slice(0, i),
-                    unitPrompt: detectedUnitPrompt
-                };
-            }
-        }
-        // Also handle house number separated by comma from the street (e.g. "354, Castlehill")
-        const standaloneNum = part.match(/^(\d+(?:[a-z]|-\d+)?)$/i);
-        if (standaloneNum && i + 1 < remaining.length) {
-            const leadNum = standaloneNum[1];
-            if (!/^(?:\d+(?:st|nd|rd|th))$/i.test(leadNum)) {
-                const street = remaining.slice(i + 1).join(', ');
-                return {
-                    street: cleanStreetName(street),
-                    numberPart: leadNum,
-                    premises: remaining.slice(0, i),
-                    unitPrompt: detectedUnitPrompt
-                };
-            }
-        }
-    }
-
-    // Rule 4: With no number, anchor on first part ending in a thoroughfare word
-    for (let i = 0; i < remaining.length; i++) {
-        const words = remaining[i].split(/\s+/);
-        const lastWord = words[words.length - 1].toLowerCase();
-        if (THOROUGHFARE_WORDS.has(lastWord)) {
-            const street = remaining.slice(i).join(', ');
+    // If a verifiedRoadSet (normalized OSM road keys for this postcode/outcode) is provided:
+    // Prefer candidate carrying the house number that matches OSM, then rightmost candidate matching OSM
+    if (verifiedRoadSet && verifiedRoadSet.size > 0) {
+        const numberedMatches = parsedParts.filter(p => p.numberPart && verifiedRoadSet.has(p.text.toLowerCase()));
+        if (numberedMatches.length > 0) {
+            const chosen = numberedMatches[numberedMatches.length - 1];
             return {
-                street: cleanStreetName(street),
-                numberPart: null,
-                premises: remaining.slice(0, i),
-                unitPrompt: detectedUnitPrompt
+                street: chosen.text,
+                numberPart: chosen.numberPart,
+                premises: parsedParts.slice(0, chosen.idx).map(p => p.raw),
+                unitPrompt: detectedUnitPrompt,
+                candidates
+            };
+        }
+        const anyMatches = parsedParts.filter(p => verifiedRoadSet.has(p.text.toLowerCase()));
+        if (anyMatches.length > 0) {
+            const chosen = anyMatches[anyMatches.length - 1];
+            const numPart = chosen.numberPart || parsedParts.find(p => p.numberPart)?.numberPart || null;
+            return {
+                street: chosen.text,
+                numberPart: numPart,
+                premises: parsedParts.filter(p => p !== chosen).map(p => p.raw),
+                unitPrompt: detectedUnitPrompt,
+                candidates
             };
         }
     }
 
-    // Rule 5: 2 or more parts -> drop first part (premises) and treat rest as street
-    if (remaining.length >= 2) {
+    // Rule 3: Anchor on part with leading house number or range
+    const numberedIdx = parsedParts.findIndex(p => p.numberPart !== null);
+    if (numberedIdx !== -1) {
+        const chosen = parsedParts[numberedIdx];
+        // If there is a later part that is also a thoroughfare (e.g. "12 Somersby Court, Somersby Street"),
+        // keep the numbered part if it's a thoroughfare, otherwise check if a later part is the main street
         return {
-            street: cleanStreetName(remaining.slice(1).join(', ')),
-            numberPart: null,
-            premises: [remaining[0]],
-            unitPrompt: detectedUnitPrompt
+            street: chosen.text,
+            numberPart: chosen.numberPart,
+            premises: parsedParts.slice(0, numberedIdx).map(p => p.raw),
+            unitPrompt: detectedUnitPrompt,
+            candidates
         };
     }
 
-    // 1 part: premises only
+    // Rule 4: With no number, check parts ending in a thoroughfare word (or directional suffix).
+    // When multiple parts end in thoroughfare words (e.g. "Wood Close, Baslow Road" or "Somersby Court, Somersby Street"),
+    // prefer the rightmost thoroughfare part as the street and treat earlier parts as building/house names.
+    const thoroughfareParts = parsedParts.filter(p => p.isThoroughfare);
+    if (thoroughfareParts.length > 0) {
+        const chosen = thoroughfareParts[thoroughfareParts.length - 1];
+        const chosenPos = parsedParts.indexOf(chosen);
+        return {
+            street: chosen.text,
+            numberPart: null,
+            premises: parsedParts.slice(0, chosenPos).map(p => p.raw),
+            unitPrompt: detectedUnitPrompt,
+            candidates
+        };
+    }
+
+    // Rule 5: 2 or more parts with no recognized thoroughfare word -> take last part as candidate street/locality
+    if (parsedParts.length >= 2) {
+        const lastPart = parsedParts[parsedParts.length - 1];
+        return {
+            street: lastPart.text,
+            numberPart: null,
+            premises: parsedParts.slice(0, -1).map(p => p.raw),
+            unitPrompt: detectedUnitPrompt,
+            candidates
+        };
+    }
+
+    // 1 part: premises/organisation only (street will be inherited from same postcode or centroid reverse geocode)
     return {
         street: null,
         numberPart: null,
-        premises: [remaining[0]],
-        unitPrompt: detectedUnitPrompt
+        premises: [parsedParts[0].raw],
+        unitPrompt: detectedUnitPrompt,
+        candidates
     };
 }
 
@@ -447,7 +524,6 @@ const getStreets = async (req, res) => {
 
         const db = req.app.locals.db || mongoose.connection.db;
         const coll = db.collection('address_master_merged');
-        const dictColl = db.collection('search_dictionary');
 
         let effectivePc = pc;
         const isFull = /^[A-Z]{1,2}[0-9][A-Z0-9]?\s+[0-9][A-Z]{2}$/i.test(effectivePc);
@@ -457,16 +533,15 @@ const getStreets = async (req, res) => {
         const fallbackPremisesSet = new Set();
 
         if (isFull) {
-            // 1. Exact full postcode lookup in address_master_merged (uses { postcode: 1, address: 1 } index)
+            // 1. Exact full postcode lookup in address_master_merged (covered by { postcode: 1, district: 1, address: 1 } index)
             const rows = await coll.find({ postcode: effectivePc })
-                .project({ address: 1, district: 1, street: 1 })
+                .project({ address: 1, district: 1, postcode: 1, _id: 0 })
+                .maxTimeMS(500)
                 .toArray();
 
             for (const row of rows) {
                 if (!town && row.district) town = row.district;
-                if (row.street) {
-                    streetSet.add(cleanStreetName(row.street));
-                } else if (row.address) {
+                if (row.address) {
                     const parsed = parseAddressRow(row.address);
                     if (parsed && parsed.street) {
                         streetSet.add(parsed.street);
@@ -480,99 +555,67 @@ const getStreets = async (req, res) => {
                 for (const p of fallbackPremisesSet) streetSet.add(p);
             }
         } else {
-            // 2. Sector ("DN41 7") or Outcode ("DN41") lookup
+            // 2. Sector ("DN41 7") or Outcode ("DN41") lookup directly on address_master_merged
+            // Uses covered compound index { postcode: 1, district: 1, address: 1 } with maxTimeMS(500) and no 2,500-row cap
             const buildRangePrefix = (code) => (code.includes(' ') ? code : `${code} `);
             let rangePrefix = buildRangePrefix(effectivePc);
 
-            // 2a. Fast lookup in pre-parsed search_dictionary (type: 'street')
-            let dictDocs = await dictColl.find({
-                type: 'street',
-                postcodes: { $elemMatch: { $gte: rangePrefix, $lt: `${rangePrefix}\uffff` } }
-            }).project({ street: 1, display: 1, town: 1 }).limit(MAX_STREETS + 50).maxTimeMS(1500).toArray().catch(() => []);
+            let rows = await coll.find({
+                postcode: { $gte: rangePrefix, $lt: `${rangePrefix}\uffff` }
+            })
+                .project({ address: 1, district: 1, postcode: 1, _id: 0 })
+                .maxTimeMS(500)
+                .toArray()
+                .catch(() => []);
 
-            // If outcode with space had 0 matches (e.g. "SW1" where postcodes are "SW1A 1AA"), try prefix without space
-            if (dictDocs.length === 0 && !effectivePc.includes(' ')) {
-                dictDocs = await dictColl.find({
-                    type: 'street',
-                    postcodes: { $elemMatch: { $gte: effectivePc, $lt: `${effectivePc}\uffff` } }
-                }).project({ street: 1, display: 1, town: 1 }).limit(MAX_STREETS + 50).maxTimeMS(1500).toArray().catch(() => []);
+            // If outcode with trailing space had 0 matches (e.g. "SW1" where postcodes are "SW1A 1AA"), try prefix without space
+            if (rows.length === 0 && !effectivePc.includes(' ')) {
+                rows = await coll.find({
+                    postcode: { $gte: effectivePc, $lt: `${effectivePc}\uffff` }
+                })
+                    .project({ address: 1, district: 1, postcode: 1, _id: 0 })
+                    .maxTimeMS(500)
+                    .toArray()
+                    .catch(() => []);
             }
 
             // If 2-digit outcode was typed with a space (e.g. "AL1 0" or "DN4 1") and returned 0 docs, try collapsed outcode ("AL10" / "DN41")
-            if (dictDocs.length === 0 && /^([A-Z]{1,2}[0-9])\s+([0-9])$/i.test(effectivePc)) {
+            if (rows.length === 0 && /^([A-Z]{1,2}[0-9])\s+([0-9])$/i.test(effectivePc)) {
                 const collapsed = effectivePc.replace(/\s+/g, '');
                 const collapsedPrefix = `${collapsed} `;
-                const fallbackDocs = await dictColl.find({
-                    type: 'street',
-                    postcodes: { $elemMatch: { $gte: collapsedPrefix, $lt: `${collapsedPrefix}\uffff` } }
-                }).project({ street: 1, display: 1, town: 1 }).limit(MAX_STREETS + 50).maxTimeMS(1500).toArray().catch(() => []);
-
-                if (fallbackDocs.length > 0) {
-                    dictDocs = fallbackDocs;
+                rows = await coll.find({
+                    postcode: { $gte: collapsedPrefix, $lt: `${collapsedPrefix}\uffff` }
+                })
+                    .project({ address: 1, district: 1, postcode: 1, _id: 0 })
+                    .maxTimeMS(500)
+                    .toArray()
+                    .catch(() => []);
+                if (rows.length > 0) {
                     effectivePc = collapsed;
-                    rangePrefix = collapsedPrefix;
                 }
             }
 
-            for (const d of dictDocs) {
-                if (!town && d.town) town = d.town;
-                const stName = cleanStreetName(d.street || d.display);
-                if (stName) streetSet.add(stName);
+            for (const row of rows) {
+                if (!town && row.district) town = row.district;
+                if (row.address) {
+                    const parsed = parseAddressRow(row.address);
+                    if (parsed && parsed.street) {
+                        streetSet.add(parsed.street);
+                    } else if (parsed && parsed.premises && parsed.premises.length > 0) {
+                        fallbackPremisesSet.add(cleanStreetName(parsed.premises.join(', ')));
+                    }
+                }
             }
 
-            // 2b. Fallback to indexed range scan on address_master_merged if search_dictionary had no hits
-            if (streetSet.size === 0) {
-                let rows = await coll.find({
-                    postcode: { $gte: rangePrefix, $lt: `${rangePrefix}\uffff` }
-                }).project({ address: 1, district: 1, street: 1 }).limit(2500).toArray();
-
-                if (rows.length === 0 && /^([A-Z]{1,2}[0-9])\s+([0-9])$/i.test(effectivePc)) {
-                    const collapsed = effectivePc.replace(/\s+/g, '');
-                    const collapsedPrefix = `${collapsed} `;
-                    rows = await coll.find({
-                        postcode: { $gte: collapsedPrefix, $lt: `${collapsedPrefix}\uffff` }
-                    }).project({ address: 1, district: 1, street: 1 }).limit(2500).toArray();
-                    if (rows.length > 0) {
-                        effectivePc = collapsed;
-                    }
-                }
-
-                for (const row of rows) {
-                    if (!town && row.district) town = row.district;
-                    if (row.street) {
-                        streetSet.add(cleanStreetName(row.street));
-                    } else if (row.address) {
-                        const parsed = parseAddressRow(row.address);
-                        if (parsed && parsed.street) {
-                            streetSet.add(parsed.street);
-                        } else if (parsed && parsed.premises && parsed.premises.length > 0) {
-                            fallbackPremisesSet.add(cleanStreetName(parsed.premises.join(', ')));
-                        }
-                    }
-                }
-
-                if (streetSet.size === 0 && fallbackPremisesSet.size > 0) {
-                    for (const p of fallbackPremisesSet) streetSet.add(p);
-                }
+            if (streetSet.size === 0 && fallbackPremisesSet.size > 0) {
+                for (const p of fallbackPremisesSet) streetSet.add(p);
             }
         }
 
         const centroid = await getPostcodeCentroid(effectivePc);
 
-        // 3. Fallback to search_dictionary (exact postcode) and local UK Nominatim if streetSet is still empty (e.g. EH1 1YZ, SW1A 1AA)
+        // 3. Fallback to local UK Nominatim if streetSet is still empty (e.g. EH1 1YZ, SW1A 1AA, or org-only postcode)
         if (streetSet.size === 0) {
-            if (isFull) {
-                const dictExact = await dictColl.find({
-                    type: { $in: ['street', 'building', 'premises'] },
-                    postcodes: effectivePc
-                }).project({ street: 1, display: 1, town: 1 }).limit(50).toArray().catch(() => []);
-
-                for (const d of dictExact) {
-                    if (!town && d.town) town = d.town;
-                    const stName = cleanStreetName(d.street || d.display);
-                    if (stName) streetSet.add(stName);
-                }
-            }
 
             if (streetSet.size === 0) {
                 try {
