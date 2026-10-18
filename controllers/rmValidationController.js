@@ -658,7 +658,52 @@ const getStreets = async (req, res) => {
             }
         }
 
-        const allSortedStreets = Array.from(streetSet).filter(Boolean).sort((a, b) => a.localeCompare(b));
+        let filteredStreets = Array.from(streetSet).filter(Boolean);
+
+        // HIDE_UNVERIFIED_STREETS configuration switch (default: true)
+        // If enabled and verified street precomputations exist (sector_streets or street_verification),
+        // filter out unverified streets so customers only see validated thoroughfares on the map.
+        const hideUnverified = process.env.HIDE_UNVERIFIED_STREETS !== 'false';
+        if (hideUnverified && filteredStreets.length > 0) {
+            try {
+                const outcodePart = effectivePc.split(' ')[0].toUpperCase();
+                // 1. Check primary sector_streets collection
+                const verColl = db.collection('sector_streets');
+                const verifiedDocs = await verColl.find({
+                    outcode: outcodePart,
+                    $or: [{ verified: true }, { unverifiedAllowed: true }]
+                }).project({ streetKey: 1, display: 1, _id: 0 }).toArray().catch(() => []);
+
+                if (verifiedDocs && verifiedDocs.length > 0) {
+                    const verifiedKeySet = new Set(
+                        verifiedDocs.map(d => (d.streetKey || d.display || '').toLowerCase().trim())
+                    );
+                    const matched = filteredStreets.filter(s => verifiedKeySet.has(s.toLowerCase().trim()));
+                    if (matched.length > 0) {
+                        filteredStreets = matched;
+                    }
+                } else {
+                    // 2. Check pilot street_verification collection as fallback
+                    const pilotVerColl = db.collection('street_verification');
+                    const pilotDocs = await pilotVerColl.find({
+                        outcode: outcodePart,
+                        found: true
+                    }).project({ streetKey: 1, street: 1, _id: 0 }).toArray().catch(() => []);
+
+                    if (pilotDocs && pilotDocs.length > 0) {
+                        const pilotKeySet = new Set(
+                            pilotDocs.map(d => (d.streetKey || d.street || '').toLowerCase().trim())
+                        );
+                        const matched = filteredStreets.filter(s => pilotKeySet.has(s.toLowerCase().trim()));
+                        if (matched.length > 0) {
+                            filteredStreets = matched;
+                        }
+                    }
+                }
+            } catch (_) {}
+        }
+
+        const allSortedStreets = filteredStreets.sort((a, b) => a.localeCompare(b));
         const truncated = allSortedStreets.length > MAX_STREETS;
         const uniqueStreets = truncated ? allSortedStreets.slice(0, MAX_STREETS) : allSortedStreets;
 
@@ -932,7 +977,7 @@ const findBusiness = async (req, res) => {
 
         const db = req.app.locals.db || mongoose.connection.db;
         const dictColl = db.collection('search_dictionary');
-        const chColl = db.collection('ch_data');
+        const chColl = db.collection('company_house');
 
         const cleanQ = significantWords.join(' ');
         const regexTerm = new RegExp('(^|\\s)' + cleanQ.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
@@ -960,10 +1005,13 @@ const findBusiness = async (req, res) => {
 
             chColl.find({
                 CompanyStatus: 'Active',
+                CompanyName: {
+                    $regex: regexTerm,
+                    $not: /^[^a-zA-Z0-9]/
+                },
                 ...(isPostcodeArea
-                    ? { 'RegAddress.PostCode': { $regex: `^${areaRaw}[0-9]` } }
-                    : { 'RegAddress.PostTown': areaRaw }),
-                CompanyName: regexTerm
+                    ? { 'RegAddress.PostCode': { $regex: `^${areaRaw}[0-9]`, $options: 'i' } }
+                    : { 'RegAddress.PostTown': new RegExp(`^${areaRaw}$`, 'i') })
             }).limit(50).project({
                 CompanyName: 1,
                 CompanyNumber: 1,
@@ -1002,19 +1050,21 @@ const findBusiness = async (req, res) => {
             }
         }
 
-        // Format CH docs
+        // Format CH docs (nested RegAddress in company_house collection)
         for (const ch of chRows) {
             const name = ch.CompanyName || '';
-            const pc = ch['RegAddress.PostCode'] || '';
+            if (!name || /^[^a-zA-Z0-9]/.test(name)) continue;
+            const regAddr = ch.RegAddress || {};
+            const pc = regAddr.PostCode || ch['RegAddress.PostCode'] || '';
             const key = `${name.toLowerCase()}_${pc}`;
 
             if (!seen.has(key)) {
                 seen.add(key);
                 combined.push({
                     name,
-                    street: ch['RegAddress.AddressLine1'] || '',
+                    street: regAddr.AddressLine1 || ch['RegAddress.AddressLine1'] || '',
                     postcode: pc,
-                    town: ch['RegAddress.PostTown'] || areaRaw,
+                    town: regAddr.PostTown || ch['RegAddress.PostTown'] || areaRaw,
                     source: 'Companies House'
                 });
             }

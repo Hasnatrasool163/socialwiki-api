@@ -10,6 +10,7 @@ const express = require('express');
 const { verifyToken } = require('../middlewares/authmiddleware');
 const botProtect = require('../middlewares/botProtect');
 const suggestLimiter = require('../middlewares/suggestLimiter');
+const searchSessionLimiter = require('../middlewares/searchSessionLimiter');
 const {
     getPostcodes,
     getStreets,
@@ -31,8 +32,8 @@ router.get('/streets',   ...guard, getStreets);
 router.post('/validate', ...guard, validateAddress);
 router.post('/locate',   ...guard, locateAddress);
 
-// Business find flow: Find a business address
-router.get('/business',  ...guard, findBusiness);
+// Business find flow: Find a business address (tier-restricted via searchSessionLimiter)
+router.get('/business',  ...guard, searchSessionLimiter, findBusiness);
 router.get('/areas',     ...guard, suggestLimiter, getAreas);
 
 // Self-hosted UK Nominatim direct search & reverse lookup
