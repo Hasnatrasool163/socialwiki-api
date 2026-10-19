@@ -24,6 +24,14 @@
  * 5. Off-peak concurrency: Max 4 workers to protect local PostgreSQL / MongoDB.
  */
 
+const nodeCrypto = require('crypto');
+if (typeof globalThis.crypto === 'undefined') {
+    globalThis.crypto = nodeCrypto.webcrypto || nodeCrypto;
+}
+if (typeof global.crypto === 'undefined') {
+    global.crypto = nodeCrypto.webcrypto || nodeCrypto;
+}
+
 require('dotenv').config();
 const os = require('os');
 const axios = require('axios');
