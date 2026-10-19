@@ -33,7 +33,8 @@ const { haversineDistanceMeters } = require('../utils/bngToWgs84');
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/web_postalwiki';
 const NOMINATIM_URL = (process.env.NOMINATIM_URL || 'http://127.0.0.1:8088').replace(/\/+$/, '');
 const DATA_VERSION = 'osm-gb-2026-10-v2';
-const MAX_CONCURRENCY = 4;
+const concurrencyArg = (process.argv.find(a => a.startsWith('--concurrency=')) || '').replace('--concurrency=', '');
+const MAX_CONCURRENCY = concurrencyArg ? parseInt(concurrencyArg, 10) : 8;
 
 const httpClient = axios.create({
     baseURL: NOMINATIM_URL,
@@ -77,8 +78,8 @@ const DIRECTIONAL_WORDS = new Set([
     'north', 'south', 'east', 'west', 'upper', 'lower', 'central', 'inner', 'outer'
 ]);
 
-const FLOOR_PART_REGEX = /^(?:(?:ground|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|[0-9]+(?:st|nd|rd|th)|lower\s+ground|upper\s+ground|street|top|middle|main|sub)\s+(?:floor|level)(?:\s+(?:north|south|east|west|left|right|front|rear|wing))?|basement|sub-basement|mezzanine|penthouse|annexe|annex|attic|cellar|[0-9]\/[a-z0-9]|[a-z]\/[a-z0-9]|[0-9]f[0-9]|pf[0-9]|bf[0-9]|gf|ff|sf|tf)$/i;
-const UNIT_PART_REGEX = /^(?:flat|unit|room|apartment|apt|suite|studio|block)\b(?:\s+[a-z0-9\/-]+)?$/i;
+const FLOOR_PART_REGEX = /^(?:(?:ground|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|[0-9]+(?:st|nd|rd|th)|lower\s+ground|upper\s+ground|street|top|middle|main|sub)\s+(?:floor|level)(?:\s+(?:north|south|east|west|left|right|front|rear|wing))?|basement|sub-basement|mezzanine|penthouse|annexe|annex|attic|cellar|[0-9]+(?:\/[0-9a-z]+)+|[a-z]\/[a-z0-9]|[0-9]+f[0-9]+|pf[0-9]+|bf[0-9]+|gf|ff|sf|tf|[0-9]+[a-z]\b)$/i;
+const UNIT_PART_REGEX = /^(?:flat|unit|room|apartment|apt|suite|studio|block|shop|kiosk|stall)\b(?:\s+[a-z0-9\/-]+)?$/i;
 
 const ABBREV_MAP = {
     'st': 'street',
@@ -188,7 +189,8 @@ function parseAddressRowToCandidate(rawAddress) {
     for (const p of rawParts) {
         if (UNIT_PART_REGEX.test(p) && !hasThoroughfareEnding(p)) continue;
         if (FLOOR_PART_REGEX.test(p) && !hasThoroughfareEnding(p)) continue;
-        const inlineFlat = p.match(/^((?:flat|unit|apt|apartment|room|suite)\s+[0-9a-z\/-]+)\s+(\d+[a-z]?(?:-\d+[a-z]?)?\s+.+)$/i);
+        const inlineFlat = p.match(/^((?:(?:flat|unit|apt|apartment|room|suite|shop)\s+)?[0-9a-z]+[/-][0-9a-z]+|[0-9]+f[0-9]+)\s+(\d+(?:[a-z]|(?:\/[0-9a-z]+))?(?:-\d+[a-z]?)?\s+.+)$/i)
+            || p.match(/^((?:flat|unit|apt|apartment|room|suite|shop)\s+[0-9a-z\/-]+)\s+(\d+(?:[a-z]|(?:\/[0-9a-z]+))?(?:-\d+[a-z]?)?\s+.+)$/i);
         if (inlineFlat) {
             remaining.push(inlineFlat[2]);
             continue;
@@ -198,7 +200,7 @@ function parseAddressRowToCandidate(rawAddress) {
     if (!remaining.length) return null;
 
     const parsedParts = remaining.map((part, idx) => {
-        const numMatch = part.match(/^(\d+[a-z]?(?:-\d+[a-z]?)?)\s+(.+)$/i);
+        const numMatch = part.match(/^(\d+(?:[a-z]|(?:\/[0-9a-z]+))?(?:-\d+[a-z]?)?)\s+(.+)$/i);
         if (numMatch && !/^(?:\d+(?:st|nd|rd|th))$/i.test(numMatch[1])) {
             return {
                 idx,
@@ -215,9 +217,9 @@ function parseAddressRowToCandidate(rawAddress) {
         };
     });
 
-    // Check standalone number before comma (e.g. "354, Castlehill")
+    // Check standalone number before comma (e.g. "354, Castlehill" or "12/1, Castlehill")
     for (let i = 0; i < parsedParts.length - 1; i++) {
-        const m = parsedParts[i].text.match(/^(\d+[a-z]?(?:-\d+[a-z]?)?)$/i);
+        const m = parsedParts[i].text.match(/^(\d+(?:[a-z]|(?:\/[0-9a-z]+))?(?:-\d+[a-z]?)?)$/i);
         if (m && !/^(?:\d+(?:st|nd|rd|th))$/i.test(m[1])) {
             parsedParts[i + 1].numberPart = m[1];
             parsedParts.splice(i, 1);
@@ -225,30 +227,33 @@ function parseAddressRowToCandidate(rawAddress) {
         }
     }
 
+    let candidate = null;
     // Prefer numbered thoroughfare part
     const numbered = parsedParts.filter(p => p.numberPart && p.isThoroughfare);
     if (numbered.length > 0) {
-        return numbered[numbered.length - 1].text;
+        candidate = numbered[numbered.length - 1].text;
+    } else {
+        // Prefer rightmost thoroughfare part
+        const thoroughfares = parsedParts.filter(p => p.isThoroughfare);
+        if (thoroughfares.length > 0) {
+            candidate = thoroughfares[thoroughfares.length - 1].text;
+        } else {
+            // Numbered part even without known thoroughfare suffix (e.g. "14 The Nook")
+            const anyNumbered = parsedParts.filter(p => p.numberPart);
+            if (anyNumbered.length > 0) {
+                candidate = anyNumbered[anyNumbered.length - 1].text;
+            } else if (parsedParts.length >= 2) {
+                candidate = parsedParts[parsedParts.length - 1].text;
+            }
+        }
     }
 
-    // Prefer rightmost thoroughfare part
-    const thoroughfares = parsedParts.filter(p => p.isThoroughfare);
-    if (thoroughfares.length > 0) {
-        return thoroughfares[thoroughfares.length - 1].text;
-    }
-
-    // Numbered part even without known thoroughfare suffix (e.g. "14 The Nook")
-    const anyNumbered = parsedParts.filter(p => p.numberPart);
-    if (anyNumbered.length > 0) {
-        return anyNumbered[anyNumbered.length - 1].text;
-    }
-
-    // Last part if 2+ parts
-    if (parsedParts.length >= 2) {
-        return parsedParts[parsedParts.length - 1].text;
-    }
-
-    return null;
+    if (!candidate) return null;
+    candidate = cleanStreetName(candidate);
+    if (!candidate || !/[a-z]/i.test(candidate)) return null;
+    if (UNIT_PART_REGEX.test(candidate) && !hasThoroughfareEnding(candidate)) return null;
+    if (FLOOR_PART_REGEX.test(candidate) && !hasThoroughfareEnding(candidate)) return null;
+    return candidate;
 }
 
 /**
@@ -344,15 +349,15 @@ async function verifyStreetWithNominatim(streetName, postcodes, centroidMap, out
 
     const queries = [];
     if (outcode) queries.push({ q: `${streetName}, ${outcode}` });
-    if (town) queries.push({ q: `${streetName}, ${town}` });
-    queries.push({ street: streetName });
-    queries.push({ q: streetName });
-    if (stExpanded !== streetName) {
-        if (outcode) queries.push({ q: `${stExpanded}, ${outcode}` });
-        queries.push({ q: stExpanded });
+    if (town && (!outcode || town.toLowerCase() !== outcode.toLowerCase())) {
+        queries.push({ q: `${streetName}, ${town}` });
     }
+    if (stExpanded !== streetName && outcode) {
+        queries.push({ q: `${stExpanded}, ${outcode}` });
+    }
+    queries.push({ street: streetName });
 
-    // 1. First attempt: bounded search in postcode viewbox
+    // Bounded search in postcode viewbox (max 2-3 queries per street)
     for (const qObj of queries) {
         try {
             const params = {
@@ -372,29 +377,6 @@ async function verifyStreetWithNominatim(streetName, postcodes, centroidMap, out
                 if (match && (match.distanceM <= 3500 || coords.length === 0)) return match;
             }
         } catch (_) {}
-    }
-
-    // 2. Second attempt: unbounded search biased by viewbox
-    if (bbox) {
-        for (const qObj of queries.slice(0, 2)) {
-            try {
-                const res = await httpClient.get('/search', {
-                    params: {
-                        ...qObj,
-                        viewbox: bbox.viewbox,
-                        bounded: 0,
-                        format: 'jsonv2',
-                        addressdetails: 1,
-                        countrycodes: 'gb',
-                        limit: 5
-                    }
-                });
-                for (const hit of res.data || []) {
-                    const match = checkHit(hit);
-                    if (match && match.distanceM <= 4500) return match;
-                }
-            } catch (_) {}
-        }
     }
 
     return { matched: false, matchType: 'osm_gap', osmId: null, distanceM: null };
