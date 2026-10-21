@@ -98,6 +98,7 @@ const importSSUrl = async (req, res) => {
         let successCount = 0;
         let errorsCount = 0;
         let notFoundCount = 0;
+        let notFoundUrls = [];
         let duplicateCount = 0;
         let errorMessages = [];
         let resultDebug = [];
@@ -148,6 +149,7 @@ const importSSUrl = async (req, res) => {
 
                     if (response.status === 404) {
                         notFoundCount++;
+                        notFoundUrls.push(url);
                         resultDebug.push(`Image not found at URL: ${bucketName}/${image}`);
                         return;
                     }
@@ -157,6 +159,7 @@ const importSSUrl = async (req, res) => {
 
                     if (!imgExists) {
                         notFoundCount++;
+                        notFoundUrls.push(url);
                         const msg = `Image not a WebP image or error: ${bucketName}/${image} (Status: ${response.status})`;
                         resultDebug.push(msg);
                         ssUrlLogger.error(msg, { url: imageUrl, image, reason: `Invalid Content Type or Status ${response.status}` });
@@ -323,7 +326,8 @@ const importSSUrl = async (req, res) => {
             notfound: notFoundCount,
             duplicates: duplicateCount,
             errormessages: errorMessages.join('<br>'),
-            resultdebug: resultDebug.join('<br>')
+            resultdebug: resultDebug.join('<br>'),
+            notfound_urls: notFoundUrls
         });
 
     } catch (error) {
@@ -337,7 +341,8 @@ const importSSUrl = async (req, res) => {
             notfound: 0,
             duplicates: 0,
             errormessages: `Server error: ${error.message}`,
-            resultdebug: ''
+            resultdebug: '',
+            notfound_urls: []
         });
     }
 }
